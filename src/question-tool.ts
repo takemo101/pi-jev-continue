@@ -109,6 +109,17 @@ export function registerChoiceTool(pi: ExtensionAPI, hooks: ChoiceToolHooks): Ch
     return unanswered(question, "The multiple-choice question was cancelled.", "cancelled");
   }
 
+  pi.on("tool_execution_start", (event, ctx) => {
+    if (event.toolName !== "jev_choose") return;
+    // pi の schema 検証は tool_call / execute より先に失敗し得るため、開始境界でも確認する。
+    try {
+      parseQuestion(event.args);
+    } catch {
+      awaitingHuman = true;
+      hooks.pause(ctx, "Invalid multiple-choice question; human input is required.");
+    }
+  });
+
   pi.registerTool<typeof ChoiceQuestionSchema, ChoiceToolDetails, unknown>({
     name: "jev_choose",
     label: "Jev choice",

@@ -54,6 +54,7 @@ function harness(t: TestContext, options: HarnessOptions = {}) {
   const contextAbort = new AbortController();
   // このハーネスは本ツールが使用する pi の機能だけを実装する。
   const pi = {
+    on() { return () => {}; },
     registerTool(tool: ChoiceTool) { registered = tool; },
     appendEntry(type: string, data: unknown) { entries.push({ type, data }); },
   } as unknown as ExtensionAPI;

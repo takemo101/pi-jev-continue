@@ -53,7 +53,7 @@ function harness(t: TestContext, flags: Record<string, string> = {}) {
   function emit(name: "agent_before_settle", event: AgentBeforeSettleEvent): Promise<AgentBeforeSettleEventResult | undefined>;
   function emit(name: string, event?: unknown): unknown;
   function emit(name: string, event: unknown = {}): unknown {
-    return handlers.get(name)!(event, ctx);
+    return handlers.get(name)?.(event, ctx);
   }
   const command = (name: string, args = "") => commands.get(name)!.handler(args, ctx);
   emit("session_start", { reason: "startup" });
@@ -277,6 +277,7 @@ test("an autonomous question returns the non-first choice without disabling the 
   const h = harness(t);
   t.mock.method(globalThis, "fetch", async () => questionAnswer());
   await h.command("jev-on", "Build an offline single-process CLI with persistent storage and no database server");
+  h.emit("tool_execution_start", { toolName: "jev_choose", args: implementationQuestion });
   const result = await h.choose(implementationQuestion);
   assert.ok(result.details && typeof result.details === "object");
   assert.ok("status" in result.details && result.details.status === "answered");
@@ -316,3 +317,25 @@ test("manual stop invalidates an in-flight question without opening a fallback d
   assert.ok("status" in result.details && result.details.status !== "answered");
   assert.equal(h.entries.filter((entry) => entry.type === "jev-choice-judgment").length, 0);
 });
+
+for (const [name, args] of [
+  ["too few options", { ...implementationQuestion, options: implementationQuestion.options.slice(0, 1) }],
+  ["missing approval flag", { question: implementationQuestion.question, context: implementationQuestion.context, options: implementationQuestion.options }],
+] as const) {
+  test(`host-rejected question (${name}) stops before execute and blocks later tools`, async (t) => {
+    const h = harness(t);
+    const fetch = t.mock.method(globalThis, "fetch", async () => questionAnswer());
+    await h.command("jev-on", "Build an offline CLI");
+    // pi emits this before its schema validation; execute is never called on rejection.
+    h.emit("tool_execution_start", { toolName: "jev_choose", args });
+    assert.match(h.status(), /off/);
+    const blocked = h.emit("tool_call", { toolName: "write", input: { path: "forbidden.txt", content: "not approved" } });
+    assert.ok(blocked && typeof blocked === "object" && "block" in blocked && blocked.block === true);
+    h.emit("turn_end");
+    assert.equal(h.aborts(), 1);
+    assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+    assert.equal(fetch.mock.callCount(), 0);
+    h.emit("input", { source: "interactive", text: "Correct the question before continuing." });
+    assert.equal(h.emit("tool_call", { toolName: "read", input: { path: "README.md" } }), undefined);
+  });
+}
