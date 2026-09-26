@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import type { AgentBeforeSettleEvent, AgentBeforeSettleEventResult, ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { AgentBeforeSettleEvent, AgentBeforeSettleEventResult, ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import jevContinue from "../src/index.ts";
 
 type Handler = (event: unknown, ctx: ExtensionCommandContext) => unknown;
@@ -15,17 +15,20 @@ function harness(t: TestContext, flags: Record<string, string> = {}) {
   });
   const handlers = new Map<string, Handler>();
   const commands = new Map<string, { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
+  const tools = new Map<string, ToolDefinition>();
   const sent: string[] = [];
   const entries: { type: string; data: unknown }[] = [];
   let pending = false;
   let status = "";
   let terminal: ((data: string) => unknown) | undefined;
+  let aborts = 0;
   // The harness supplies only the context capabilities exercised by this extension.
   const ctx = {
     hasUI: true,
     mode: "tui",
     signal: undefined,
     isIdle: () => true,
+    abort() { aborts += 1; },
     hasPendingMessages: () => pending,
     ui: {
       notify() {},
@@ -40,6 +43,7 @@ function harness(t: TestContext, flags: Record<string, string> = {}) {
   const pi = {
     on(name: string, handler: Handler) { handlers.set(name, handler); return () => {}; },
     registerCommand(name: string, command: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) { commands.set(name, command); },
+    registerTool(tool: ToolDefinition) { tools.set(tool.name, tool); },
     registerFlag() {},
     getFlag(name: string) { return flags[name]; },
     appendEntry(type: string, data: unknown) { entries.push({ type, data }); },
@@ -56,6 +60,12 @@ function harness(t: TestContext, flags: Record<string, string> = {}) {
   t.after(() => { emit("session_shutdown"); });
   return {
     ctx, sent, entries, emit, command,
+    async choose(params: unknown) {
+      const tool = tools.get("jev_choose");
+      assert.ok(tool, "The question must be handled by the autonomous-choice tool");
+      return tool.execute("question-1", params, ctx.signal, undefined, ctx);
+    },
+    aborts: () => aborts,
     setPending(value: boolean) { pending = value; },
     escape(data = "\u001b") { terminal?.(data); },
     status: () => status,
@@ -238,4 +248,71 @@ test("Kitty-encoded Escape stops the loop while arrow keys do not", async (t) =>
   h.escape("\u001b[27u");
   assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
   assert.equal(fetch.mock.callCount(), 1);
+});
+
+const implementationQuestion = {
+  question: "Which database should this local CLI use?",
+  context: "Single process, offline, no database server. Persistent storage is required.",
+  options: [
+    { label: "PostgreSQL", description: "Requires a separate database server." },
+    { label: "SQLite", description: "Embedded persistent storage, without a server." },
+  ],
+  requiresApproval: false,
+};
+
+function questionAnswer() {
+  return Response.json({
+    model: "jev-1.13.0", usage: { input_tokens: 100, output_tokens: 20 },
+    answers: {
+      selection: { type: "choice", choice: "option_1", confidence: 0.95,
+        probabilities: { option_0: 0.01, option_1: 0.98, defer: 0.01 } },
+      needs_human: { type: "noul", noul: 0.01 },
+      in_scope_0: { type: "noul", noul: 0.01 },
+      in_scope_1: { type: "noul", noul: 0.99 },
+    },
+  });
+}
+
+test("an autonomous question returns the non-first choice without disabling the loop", async (t) => {
+  const h = harness(t);
+  t.mock.method(globalThis, "fetch", async () => questionAnswer());
+  await h.command("jev-on", "Build an offline single-process CLI with persistent storage and no database server");
+  const result = await h.choose(implementationQuestion);
+  assert.ok(result.details && typeof result.details === "object");
+  assert.ok("status" in result.details && result.details.status === "answered");
+  assert.ok("source" in result.details && result.details.source === "jev");
+  assert.ok("optionIndex" in result.details && result.details.optionIndex === 1);
+  assert.notEqual(result.terminate, true);
+  assert.match(h.status(), /on/);
+});
+
+test("unresolved approval blocks later tools until fresh human input", async (t) => {
+  const h = harness(t);
+  h.ctx.hasUI = false;
+  await h.command("jev-on", "Build an offline CLI");
+  const fetch = t.mock.method(globalThis, "fetch", async () => questionAnswer());
+  const result = await h.choose({ ...implementationQuestion, requiresApproval: true });
+  assert.equal(result.terminate, true);
+  assert.equal(fetch.mock.callCount(), 0);
+  const blocked = h.emit("tool_call", { toolName: "bash", input: { command: "echo should-not-run" } });
+  assert.ok(blocked && typeof blocked === "object" && "block" in blocked && blocked.block === true);
+  h.emit("turn_end");
+  assert.equal(h.aborts(), 1);
+  h.emit("input", { source: "interactive", text: "Use SQLite, without destructive changes." });
+  assert.equal(h.emit("tool_call", { toolName: "bash", input: { command: "echo allowed" } }), undefined);
+});
+
+test("manual stop invalidates an in-flight question without opening a fallback dialog", async (t) => {
+  const h = harness(t);
+  const waiting = deferred();
+  t.mock.method(globalThis, "fetch", () => waiting.promise);
+  await h.command("jev-on", "Build an offline CLI");
+  const pending = h.choose(implementationQuestion);
+  await h.command("jev-off");
+  waiting.resolve(questionAnswer());
+  const result = await pending;
+  assert.equal(result.terminate, true);
+  assert.ok(result.details && typeof result.details === "object");
+  assert.ok("status" in result.details && result.details.status !== "answered");
+  assert.equal(h.entries.filter((entry) => entry.type === "jev-choice-judgment").length, 0);
 });

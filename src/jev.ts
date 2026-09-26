@@ -1,4 +1,5 @@
 import type { JudgmentState } from "./state.ts";
+import { parseChoice, parseEnvelope, parseNoul, requestJev, type JevRequestOptions } from "./client.ts";
 
 const CHOICES = ["implement", "fix", "verify", "improve", "other"] as const;
 type Choice = (typeof CHOICES)[number];
@@ -73,63 +74,13 @@ const questions = {
   },
 };
 
-function record(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function probability(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
-}
-
-function isChoice(value: unknown): value is Choice {
-  return typeof value === "string" && CHOICES.some((choice) => choice === value);
-}
-
-function invalidResponse(): never {
-  throw new Error("Jev returned an invalid judgment response.");
-}
-
 // 一つの回答だけで早期に停止判定せず、応答全体の整合性を先に検証する。
 function parseResponse(value: unknown): ParsedResponse {
-  if (!record(value) || typeof value.model !== "string" || !value.model.trim() ||
-      !record(value.answers) || !record(value.usage)) invalidResponse();
-
-  for (const key of ["input_tokens", "output_tokens"]) {
-    const count = value.usage[key];
-    if (count !== undefined && (typeof count !== "number" || !Number.isSafeInteger(count) || count < 0)) {
-      invalidResponse();
-    }
-  }
-
-  const { next_step: next, needs_human: human, in_scope: scope } = value.answers;
-  if (!record(next) || next.type !== "choice" ||
-      !isChoice(next.choice) ||
-      !probability(next.confidence) || !record(next.probabilities)) invalidResponse();
-  if (!record(human) || human.type !== "noul" || !probability(human.noul) ||
-      !record(scope) || scope.type !== "noul" || !probability(scope.noul)) invalidResponse();
-
-  const distribution = next.probabilities;
-  if (Object.keys(distribution).length !== CHOICES.length) invalidResponse();
-  let total = 0;
-  let maximum = 0;
-  for (const choice of CHOICES) {
-    const p = distribution[choice];
-    if (!probability(p)) invalidResponse();
-    total += p;
-    maximum = Math.max(maximum, p);
-  }
-  // 丸め誤差は許容するが、分布と選択値が矛盾する回答は採用しない。
-  if (Math.abs(total - 1) > 0.000001 || distribution[next.choice] !== maximum) invalidResponse();
-
-  return {
-    model: value.model,
-    answers: value.answers,
-    usage: value.usage,
-    choice: next.choice,
-    confidence: next.confidence,
-    needsHuman: human.noul,
-    inScope: scope.noul,
-  };
+  const envelope = parseEnvelope(value);
+  const next = parseChoice(envelope.answers.next_step, CHOICES);
+  const needsHuman = parseNoul(envelope.answers.needs_human);
+  const inScope = parseNoul(envelope.answers.in_scope);
+  return { ...envelope, choice: next.choice, confidence: next.confidence, needsHuman, inScope };
 }
 
 /** 通信・検証とは独立した継続ポリシー。停止理由は人への依存を最優先にする。 */
@@ -151,46 +102,13 @@ function applyPolicy(result: ParsedResponse): Judgment {
   return { ...judgment, action: result.choice, reason: `Continue with ${result.choice}: confidence ${result.confidence}, human dependency ${result.needsHuman}, goal fit ${result.inScope}.` };
 }
 
-function ensureActive(signal: AbortSignal): void {
-  // signal.reason は呼出し元の任意の値なので、その内容を通知やログに流さない。
-  if (signal.aborted) throw new DOMException("Jev judgment was cancelled.", "AbortError");
-}
-
 /**
  * Jev に一度だけ問い合わせ、検証済み回答に継続ポリシーを適用する。
  * 通信・JSON・契約違反は例外、正常な回答による停止は action: "stop" で区別する。
  */
 export async function judge(
   state: JudgmentState,
-  options: { apiKey: string; model: string; signal: AbortSignal },
+  options: JevRequestOptions,
 ): Promise<Judgment> {
-  const { apiKey, model, signal } = options;
-  ensureActive(signal);
-  let response: Response;
-  try {
-    response = await fetch("https://api.typesafe.ai/v1/systemone", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ state, model, questions }),
-      signal,
-      // 固定 API 以外へ認証ヘッダーを転送しない。
-      redirect: "error",
-    });
-  } catch {
-    // エラー本文や低レベル例外には機密情報が含まれ得るため、呼出し元へ転送しない。
-    ensureActive(signal);
-    throw new Error("Jev request failed before receiving a response.");
-  }
-  ensureActive(signal);
-  if (!response.ok) throw new Error(`Jev request failed (HTTP ${response.status}).`);
-
-  let body: unknown;
-  try {
-    body = await response.json();
-  } catch {
-    ensureActive(signal);
-    invalidResponse();
-  }
-  ensureActive(signal);
-  return applyPolicy(parseResponse(body));
+  return applyPolicy(parseResponse(await requestJev(state, questions, options)));
 }

@@ -1,8 +1,10 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AgentBeforeSettleEventResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
+import type { JevRequestOptions } from "./client.ts";
 import { judge } from "./jev.ts";
 import { buildState, INPUT_LIMITS } from "./state.ts";
+import { registerChoiceTool } from "./question-tool.ts";
 
 const DEFAULT_MODEL = "jev-1.13.0";
 const JUDGMENT_TIMEOUT_MS = 30_000;
@@ -12,7 +14,10 @@ const REPORT_INSTRUCTIONS = `Work in bounded iterations toward the goal below. A
 - Any blocker requiring human input, credentials, or approval.
 - One concrete next action within the goal, including a useful improvement if the original implementation is complete.
 Do not invent work outside the goal or claim unobserved verification. If no worthwhile in-scope action remains, say so.
-Do not ask routine permission to continue. Never treat this loop as authorization for destructive operations, deployment, purchases, or access to secrets.`;
+Do not ask routine permission to continue. For an unresolved multiple-choice implementation question, call jev_choose with the question, relevant context, and concrete options instead of asking in prose or using another question tool.
+Call jev_choose alone, without other tools in the same batch; wait for its result before acting on the choice.
+Set requiresApproval to true for destructive operations, deployment, purchases, permission changes, access to secrets, or a request for explicit human authorization. Do not rephrase approval as a routine implementation choice.
+Never treat this loop or an automatic choice as human authorization. If jev_choose cannot answer, stop and wait for the user.`;
 
 const ACTIONS = {
   implement: "Implement the next concrete change proposed in your last report.",
@@ -26,6 +31,14 @@ function parseContinuationLimit(value: string): number | undefined {
   if (!/^\d+$/.test(value)) return undefined;
   const limit = Number(value);
   return Number.isSafeInteger(limit) ? limit : undefined;
+}
+
+function getJevOptions(signal: AbortSignal): JevRequestOptions {
+  return {
+    apiKey: process.env.TYPESAFE_API_KEY?.trim() ?? "",
+    model: process.env.TYPESAFE_MODEL?.trim() || DEFAULT_MODEL,
+    signal,
+  };
 }
 
 export default function jevContinue(pi: ExtensionAPI) {
@@ -56,6 +69,7 @@ export default function jevContinue(pi: ExtensionAPI) {
     generation += 1;
     request?.abort();
     request = undefined;
+    choiceTool.cancel();
   };
   const pause = (ctx: ExtensionContext, why: string) => {
     enabled = false;
@@ -77,6 +91,7 @@ export default function jevContinue(pi: ExtensionAPI) {
       return false;
     }
     cancelRequest();
+    choiceTool.reset();
     pendingGoal = undefined;
     goal = nextGoal;
     count = 0;
@@ -89,11 +104,29 @@ export default function jevContinue(pi: ExtensionAPI) {
   };
   const directive = (action: string) => `${action}\n\n${REPORT_INSTRUCTIONS}\n\nGoal:\n${goal}`;
 
+  const choiceTool = registerChoiceTool(pi, {
+    getGoal: () => enabled ? goal : undefined,
+    getRequestOptions: getJevOptions,
+    pause,
+    timeoutMs: JUDGMENT_TIMEOUT_MS,
+  });
+
+  // 人への確認が未解決なら、モデルが別のツールで選択を迂回することも防ぐ。
+  // すでに開始済みの別ツールを巻き戻す仕組みではないため、質問ツールは単独呼出しにする。
+  pi.on("tool_call", () => {
+    if (choiceTool.isAwaitingHuman()) return { block: true, reason: "An unanswered Jev question requires human input." };
+  });
+  pi.on("turn_end", (_event, ctx) => {
+    // terminate は同じバッチの全ツールの同意が必要。混在バッチでも次のモデル要求へ進ませない。
+    if (choiceTool.isAwaitingHuman()) ctx.abort();
+  });
+
   pi.registerFlag("jev-goal", { type: "string", description: "Enable Jev continuation for this goal on the first prompt" });
   pi.registerFlag("jev-max", { type: "string", default: "0", description: "Maximum Jev continuations; 0 means unlimited" });
 
   pi.on("session_start", (event, ctx) => {
     cancelRequest();
+    choiceTool.reset();
     removeTerminalListener?.();
     removeTerminalListener = undefined;
     enabled = false;
@@ -115,7 +148,9 @@ export default function jevContinue(pi: ExtensionAPI) {
     }
     if (ctx.mode === "tui") {
       removeTerminalListener = ctx.ui.onTerminalInput((data) => {
-        if (matchesKey(data, "escape") && (enabled || pendingGoal !== undefined)) pause(ctx, "Escape pressed");
+        if (matchesKey(data, "escape") && (enabled || pendingGoal !== undefined || choiceTool.isPending())) {
+          pause(ctx, "Escape pressed");
+        }
         return undefined;
       });
     }
@@ -124,7 +159,10 @@ export default function jevContinue(pi: ExtensionAPI) {
 
   // extension 自身が送った開始メッセージでは停止せず、人の入力だけを優先する。
   pi.on("input", (event, ctx) => {
-    if (event.source !== "extension" && enabled) pause(ctx, "user input takes priority");
+    if (event.source !== "extension") {
+      if (enabled) pause(ctx, "user input takes priority");
+      choiceTool.reset();
+    }
     return { action: "continue" };
   });
 
@@ -179,11 +217,7 @@ export default function jevContinue(pi: ExtensionAPI) {
     updateStatus(ctx);
     try {
       const state = buildState(goal, messages, previousReport, count + 1);
-      const result = await judge(state, {
-        apiKey: process.env.TYPESAFE_API_KEY?.trim() ?? "",
-        model: process.env.TYPESAFE_MODEL?.trim() || DEFAULT_MODEL,
-        signal,
-      });
+      const result = await judge(state, getJevOptions(signal));
       // await 中に停止・新規開始・セッション切替が起きたら、通知もログも残さない。
       if (generation !== ticket || !enabled) return;
       if (signal.aborted) {
@@ -234,7 +268,7 @@ export default function jevContinue(pi: ExtensionAPI) {
   pi.registerCommand("jev-on", {
     description: "Start continuous development: /jev-on <goal> (sends reports to TypeSafe)",
     handler: async (args, ctx) => {
-      if (!ctx.isIdle() || ctx.hasPendingMessages() || request) {
+      if (!ctx.isIdle() || ctx.hasPendingMessages() || request || choiceTool.isPending()) {
         notify(ctx, "Stop the current run before starting a new Jev goal.", true);
         return;
       }
@@ -280,6 +314,7 @@ export default function jevContinue(pi: ExtensionAPI) {
   const leaveSession = (_event: unknown, ctx: ExtensionContext) => {
     if (enabled || pendingGoal !== undefined) pause(ctx, "session or branch changing");
     else cancelRequest();
+    choiceTool.reset();
   };
   pi.on("session_before_switch", leaveSession);
   pi.on("session_before_fork", leaveSession);
