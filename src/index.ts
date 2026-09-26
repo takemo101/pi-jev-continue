@@ -44,7 +44,7 @@ function getJevOptions(signal: AbortSignal): JevRequestOptions {
 
 export default function jevContinue(pi: ExtensionAPI) {
   let enabled = false;
-  // Jev の正常な停止は無効化ではなく、次の会話を待つ状態。
+  // 継続判定の正常停止・質問の人への委譲は、無効化せず入力を待つ。
   let waitingForInput = false;
   let goal = "";
   // count は最初の実行を除く自動継続回数。max === 0 は無制限。
@@ -117,7 +117,13 @@ export default function jevContinue(pi: ExtensionAPI) {
     getGoal: () => enabled ? goal : undefined,
     getConversation: (ctx) => historyCount === 0 ? [] : extractConversation(ctx.sessionManager.buildSessionProjection().messages, historyCount),
     getRequestOptions: getJevOptions,
-    pause,
+    waitForHuman: stopIteration,
+    onHumanAnswer: (ctx) => {
+      if (!enabled) return;
+      waitingForInput = false;
+      reason = "working";
+      updateStatus(ctx);
+    },
     timeoutMs: JUDGMENT_TIMEOUT_MS,
   });
 
@@ -171,7 +177,7 @@ export default function jevContinue(pi: ExtensionAPI) {
     updateStatus(ctx);
   });
 
-  // 実行中の人の入力は優先して解除する。Jev の正常な停止後は、有効なまま次の会話を受け付ける。
+  // 実行中の人の入力は優先して解除する。正常停止・人への委譲後は有効なまま受け付ける。
   pi.on("input", (event, ctx) => {
     if (event.source !== "extension") {
       if (enabled && !waitingForInput) pause(ctx, "user input takes priority");
