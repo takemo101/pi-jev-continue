@@ -7,7 +7,8 @@ export interface ChoiceToolHooks {
   getGoal(): string | undefined;
   getConversation(ctx: ExtensionContext): ConversationMessage[];
   getRequestOptions(signal: AbortSignal): JevRequestOptions;
-  pause(ctx: ExtensionContext, reason: string): void;
+  waitForHuman(ctx: ExtensionContext, reason: string): void;
+  onHumanAnswer(ctx: ExtensionContext): void;
   timeoutMs: number;
 }
 
@@ -63,7 +64,7 @@ function unanswered(
 function answered(question: ChoiceQuestion, optionIndex: number, source: "jev" | "human"): AgentToolResult<ChoiceToolDetails> {
   const label = question.options[optionIndex].label;
   return {
-    content: [{ type: "text", text: `Selected option ${optionIndex + 1}: ${label}\nSource: ${source}. This answers only the stated question; it does not grant additional authorization.${source === "human" ? " Jev automation remains off." : ""}` }],
+    content: [{ type: "text", text: `Selected option ${optionIndex + 1}: ${label}\nSource: ${source}. This answers only the stated question; it does not grant additional authorization.` }],
     details: { status: "answered", source, optionIndex, label, question: question.question },
   };
 }
@@ -106,7 +107,7 @@ export function registerChoiceTool(pi: ExtensionAPI, hooks: ChoiceToolHooks): Ch
     // reset 後の古い呼出しから、新しいセッションの停止状態を書き戻さない。
     if (active === operation && operation.generation === generation) {
       awaitingHuman = true;
-      hooks.pause(ctx, "The multiple-choice question was cancelled without an answer.");
+      hooks.waitForHuman(ctx, "The multiple-choice question was cancelled without an answer.");
     }
     return unanswered(question, "The multiple-choice question was cancelled.", "cancelled");
   }
@@ -118,7 +119,7 @@ export function registerChoiceTool(pi: ExtensionAPI, hooks: ChoiceToolHooks): Ch
       parseQuestion(event.args);
     } catch {
       awaitingHuman = true;
-      hooks.pause(ctx, "Invalid multiple-choice question; human input is required.");
+      hooks.waitForHuman(ctx, "Invalid multiple-choice question; human input is required.");
     }
   });
 
@@ -130,7 +131,7 @@ export function registerChoiceTool(pi: ExtensionAPI, hooks: ChoiceToolHooks): Ch
     promptGuidelines: [
       "Call jev_choose alone, never in a batch with other tools. Supply 2–8 distinct labeled options and their descriptions; do not hide a default answer in prose.",
       "Set requiresApproval to true for approval or authorization. Never use an automatic answer to grant approval or bypass another extension's UI.",
-      "Use the selected label from the tool result. If no answer is selected, stop and await human input; do not retry the question or guess. A human choice leaves Jev automation off.",
+      "Use the selected label from the tool result. If no answer is selected, stop and await human input; do not retry the question or guess. Human handoff preserves the current Jev enabled setting.",
     ],
     parameters: ChoiceQuestionSchema,
     executionMode: "sequential",
@@ -141,12 +142,12 @@ export function registerChoiceTool(pi: ExtensionAPI, hooks: ChoiceToolHooks): Ch
         question = parseQuestion(params);
       } catch {
         awaitingHuman = true;
-        hooks.pause(ctx, "Invalid multiple-choice question; human input is required.");
+        hooks.waitForHuman(ctx, "Invalid multiple-choice question; human input is required.");
         return unanswered(undefined, "Provide a valid bounded question through human input.");
       }
       if (active) {
         awaitingHuman = true;
-        hooks.pause(ctx, "Concurrent multiple-choice questions require human input.");
+        hooks.waitForHuman(ctx, "Concurrent multiple-choice questions require human input.");
         return unanswered(question, "Another question is already pending. Both questions require human attention.");
       }
       if (awaitingHuman) return unanswered(question, "An earlier question still requires human input.");
@@ -181,8 +182,8 @@ export function registerChoiceTool(pi: ExtensionAPI, hooks: ChoiceToolHooks): Ch
 
         if (!isFresh(operation)) return cancelled(question, operation, ctx);
         awaitingHuman = true;
-        hooks.pause(ctx, reason);
-        // pause は controller.cancel を呼ぶため、手動 UI 用に新しい世代の中断を登録する。
+        hooks.waitForHuman(ctx, reason);
+        // waitForHuman は controller.cancel を呼ぶため、手動 UI 用に新しい世代の中断を登録する。
         // HTTP の締切は人の思考時間には適用しない。
         operation = begin(signal, ctx.signal);
         if (!isFresh(operation)) return cancelled(question, operation, ctx);
@@ -208,6 +209,7 @@ export function registerChoiceTool(pi: ExtensionAPI, hooks: ChoiceToolHooks): Ch
         const optionIndex = choices.indexOf(selection);
         if (optionIndex < 0) return unanswered(question, "The dialog did not return one of the offered options.");
         awaitingHuman = false;
+        hooks.onHumanAnswer(ctx);
         return answered(question, optionIndex, "human");
       } finally {
         if (active === operation) active = undefined;

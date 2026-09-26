@@ -27,6 +27,8 @@ function harness(t: TestContext, flags: Record<string, string> = {}) {
   let terminal: ((data: string) => unknown) | undefined;
   let aborts = 0;
   let sessionMessages: AgentMessage[] = [];
+  let select: (options: string[]) => Promise<string | undefined> = async () => undefined;
+  const dialogOpened = Promise.withResolvers<string[]>();
   // The harness supplies only the context capabilities exercised by this extension.
   const ctx = {
     hasUI: true,
@@ -39,6 +41,10 @@ function harness(t: TestContext, flags: Record<string, string> = {}) {
     ui: {
       notify() {},
       setStatus(_key: string, text: string) { status = text; },
+      select(_title: string, options: string[]) {
+        dialogOpened.resolve(options);
+        return select(options);
+      },
       onTerminalInput(handler: (data: string) => unknown) {
         terminal = handler;
         return () => { terminal = undefined; };
@@ -65,7 +71,8 @@ function harness(t: TestContext, flags: Record<string, string> = {}) {
   emit("session_start", { reason: "startup" });
   t.after(() => { emit("session_shutdown"); });
   return {
-    ctx, sent, entries, emit, command,
+    ctx, sent, entries, emit, command, dialogOpened,
+    setSelect(handler: (options: string[]) => Promise<string | undefined>) { select = handler; },
     async choose(params: unknown) {
       const tool = tools.get("jev_choose");
       assert.ok(tool, "The question must be handled by the autonomous-choice tool");
@@ -327,13 +334,13 @@ const implementationQuestion = {
   requiresApproval: false,
 };
 
-function questionAnswer() {
+function questionAnswer(needsHuman = 0.01) {
   return Response.json({
     model: "jev-1.13.0", usage: { input_tokens: 100, output_tokens: 20 },
     answers: {
       selection: { type: "choice", choice: "option_1", confidence: 0.95,
         probabilities: { option_0: 0.01, option_1: 0.98, defer: 0.01 } },
-      needs_human: { type: "noul", noul: 0.01 },
+      needs_human: { type: "noul", noul: needsHuman },
       in_scope_0: { type: "noul", noul: 0.01 },
       in_scope_1: { type: "noul", noul: 0.99 },
     },
@@ -354,6 +361,97 @@ test("an autonomous question returns the non-first choice without disabling the 
   assert.match(h.status(), /on/);
 });
 
+for (const handoff of ["approval", "judgment", "HTTP error"] as const) {
+  test(`${handoff} handoff keeps Jev enabled and resumes judgments after a human answer`, async (t) => {
+    const h = harness(t);
+    const selection = Promise.withResolvers<string | undefined>();
+    h.setSelect(() => selection.promise);
+    const fetch = t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+      if (JSON.parse(String(init?.body)).questions.selection) {
+        return handoff === "HTTP error" ? new Response(null, { status: 503 }) : questionAnswer(0.8);
+      }
+      return answer();
+    });
+    await h.command("jev-max", "2");
+    await h.command("jev-on", "Build an offline CLI");
+    assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
+    const pending = h.choose({ ...implementationQuestion, requiresApproval: handoff === "approval" });
+    const choices = await h.dialogOpened.promise;
+    assert.match(h.status(), /on 1\/2/);
+    const callsBeforeAnswer = fetch.mock.callCount();
+    assert.equal(callsBeforeAnswer, handoff === "approval" ? 1 : 2);
+    const blocked = h.emit("tool_call", { toolName: "write" });
+    assert.ok(blocked && typeof blocked === "object" && "block" in blocked && blocked.block === true);
+    assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+    assert.equal(fetch.mock.callCount(), callsBeforeAnswer);
+    selection.resolve(choices[1]);
+    const result = await pending;
+    assert.ok(result.details && typeof result.details === "object");
+    assert.ok("source" in result.details && result.details.source === "human");
+    assert.ok("optionIndex" in result.details && result.details.optionIndex === 1);
+    assert.notEqual(result.terminate, true);
+    assert.equal(h.emit("tool_call", { toolName: "write" }), undefined);
+    assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
+    assert.match(h.status(), /on 2\/2/);
+    assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+    assert.match(h.status(), /off.*limit/);
+    assert.equal(fetch.mock.callCount(), callsBeforeAnswer + 1);
+  });
+}
+
+for (const stop of ["command", "escape", "session switch"] as const) {
+  test(`${stop} during a human question prevents a late answer from re-enabling Jev`, async (t) => {
+    const h = harness(t);
+    const selection = Promise.withResolvers<string | undefined>();
+    h.setSelect(() => selection.promise);
+    const fetch = t.mock.method(globalThis, "fetch", async () => answer());
+    await h.command("jev-on", "Build an offline CLI");
+    const pending = h.choose({ ...implementationQuestion, requiresApproval: true });
+    const choices = await h.dialogOpened.promise;
+    if (stop === "command") await h.command("jev-off");
+    else if (stop === "escape") h.escape();
+    else h.emit("session_before_switch");
+    selection.resolve(choices[1]);
+    const result = await pending;
+    assert.equal(result.terminate, true);
+    h.emit("agent_settled");
+    assert.match(h.status(), /off/);
+    h.emit("input", { source: "rpc", text: "Explain the choices." });
+    assert.equal(h.emit("before_agent_start"), undefined);
+    assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+    assert.equal(fetch.mock.callCount(), 0);
+  });
+}
+
+test("a human answer while Jev is disabled does not enable automation", async (t) => {
+  const h = harness(t);
+  h.setSelect(async (choices) => choices[1]);
+  const fetch = t.mock.method(globalThis, "fetch", async () => answer());
+  const result = await h.choose(implementationQuestion);
+  assert.ok(result.details && typeof result.details === "object" && "source" in result.details && result.details.source === "human");
+  assert.match(h.status(), /off/);
+  assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+  assert.equal(fetch.mock.callCount(), 0);
+});
+
+test("a dismissed human question keeps Jev enabled but gated until fresh input", async (t) => {
+  const h = harness(t);
+  const fetch = t.mock.method(globalThis, "fetch", async () => answer());
+  await h.command("jev-on", "Build an offline CLI");
+  const result = await h.choose({ ...implementationQuestion, requiresApproval: true });
+  assert.equal(result.terminate, true);
+  h.emit("turn_end");
+  assert.equal(h.aborts(), 1);
+  await h.emit("agent_before_settle", boundary("aborted"));
+  h.emit("agent_settled");
+  assert.match(h.status(), /on/);
+  assert.equal(fetch.mock.callCount(), 0);
+  h.emit("input", { source: "rpc", text: "Use SQLite." });
+  h.emit("before_agent_start");
+  assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
+  assert.equal(fetch.mock.callCount(), 1);
+});
+
 test("unresolved approval blocks later tools until fresh human input", async (t) => {
   const h = harness(t);
   h.ctx.hasUI = false;
@@ -366,8 +464,14 @@ test("unresolved approval blocks later tools until fresh human input", async (t)
   assert.ok(blocked && typeof blocked === "object" && "block" in blocked && blocked.block === true);
   h.emit("turn_end");
   assert.equal(h.aborts(), 1);
+  await h.emit("agent_before_settle", boundary("aborted"));
+  h.emit("agent_settled");
+  assert.match(h.status(), /on/);
   h.emit("input", { source: "interactive", text: "Use SQLite, without destructive changes." });
   assert.equal(h.emit("tool_call", { toolName: "bash", input: { command: "echo allowed" } }), undefined);
+  h.emit("before_agent_start");
+  fetch.mock.mockImplementation(async () => answer());
+  assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
 });
 
 test("manual stop invalidates an in-flight question without opening a fallback dialog", async (t) => {
@@ -395,7 +499,7 @@ for (const [name, args] of [
     await h.command("jev-on", "Build an offline CLI");
     // pi emits this before its schema validation; execute is never called on rejection.
     h.emit("tool_execution_start", { toolName: "jev_choose", args });
-    assert.match(h.status(), /off/);
+    assert.match(h.status(), /on/);
     const blocked = h.emit("tool_call", { toolName: "write", input: { path: "forbidden.txt", content: "not approved" } });
     assert.ok(blocked && typeof blocked === "object" && "block" in blocked && blocked.block === true);
     h.emit("turn_end");

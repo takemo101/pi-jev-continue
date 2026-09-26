@@ -49,8 +49,8 @@ function response(confidence = 0.95): Response {
 
 function harness(t: TestContext, options: HarnessOptions = {}) {
   let registered: ChoiceTool | undefined;
-  let goal: string | undefined = options.enabled === false ? undefined : "Improve parser regression coverage";
-  const pauses: string[] = [];
+  const goal = options.enabled === false ? undefined : "Improve parser regression coverage";
+  const handoffs: string[] = [];
   const entries: { type: string; data: unknown }[] = [];
   const dialogs: Dialog[] = [];
   const dialogOpened = Promise.withResolvers<Dialog>();
@@ -78,20 +78,19 @@ function harness(t: TestContext, options: HarnessOptions = {}) {
     getGoal: () => goal,
     getConversation: () => [],
     getRequestOptions: (signal) => ({ apiKey: "test-only-secret", model: "jev-1.13.0", signal }),
-    pause(_ctx, reason) {
-      goal = undefined;
-      pauses.push(reason);
-      // 実際の親 extension と同じく、停止はツール自身の cancel を呼ぶ。
+    waitForHuman(_ctx, reason) {
+      handoffs.push(reason);
+      // 実際の親 extension と同じく、委譲はツール自身の cancel を呼ぶ。
       controller.cancel();
     },
+    onHumanAnswer() {},
     timeoutMs: options.timeoutMs ?? 30_000,
   });
   assert.ok(registered, "registerChoiceTool must register an executable native tool");
   const tool = registered;
   t.after(() => controller.reset());
   return {
-    controller, pauses, entries, dialogs, dialogOpened, contextAbort,
-    enabled: () => goal !== undefined,
+    controller, handoffs, entries, dialogs, dialogOpened, contextAbort,
     execute(value: unknown = question(), signal?: AbortSignal) {
       // tool_call フックがホスト検証後に引数を書き換える場合も同じ境界で試す。
       return tool.execute("choice-call", value as ChoiceQuestion, signal, undefined, ctx);
@@ -119,18 +118,15 @@ test("a confident non-first answer continues through the native result without s
   assert.notEqual(result.terminate, true);
   assert.match(text(result), /Run parser regressions/);
   assert.equal(h.dialogs.length, 0);
-  assert.equal(h.pauses.length, 0);
-  assert.equal(h.enabled(), true);
   assert.equal(h.controller.isPending(), false);
   assert.equal(h.controller.isAwaitingHuman(), false);
   assert.equal(h.entries.filter((entry) => entry.type === "jev-choice-judgment").length, 1);
 });
 
-test("low confidence pauses before a manual RPC choice and leaves automation off", async (t) => {
+test("low confidence waits for a manual RPC choice before returning a human answer", async (t) => {
   const h = harness(t, {
     mode: "rpc",
     select: async (dialog) => {
-      assert.equal(h.enabled(), false);
       assert.equal(dialog.signal?.aborted, false);
       assert.match(dialog.title, /Which parser verification/);
       assert.match(dialog.title, /implementation is complete/);
@@ -146,8 +142,6 @@ test("low confidence pauses before a manual RPC choice and leaves automation off
     label: "Run parser regressions", question: question().question,
   });
   assert.notEqual(result.terminate, true);
-  assert.equal(h.pauses.length, 1);
-  assert.equal(h.enabled(), false);
   assert.equal(h.controller.isAwaitingHuman(), false);
 });
 
@@ -158,7 +152,6 @@ test("explicit approval is always handed to the human without HTTP", async (t) =
   assert.equal(fetch.mock.callCount(), 0);
   assert.equal(result.details.status, "answered");
   if (result.details.status === "answered") assert.equal(result.details.source, "human");
-  assert.equal(h.enabled(), false);
   assert.equal(h.entries.length, 0);
 });
 
@@ -169,7 +162,6 @@ test("disabled automation asks the human without HTTP", async (t) => {
   assert.equal(fetch.mock.callCount(), 0);
   assert.equal(result.details.status, "answered");
   if (result.details.status === "answered") assert.equal(result.details.source, "human");
-  assert.equal(h.enabled(), false);
 });
 
 test("non-UI handoff exposes the question and options and terminates without a retry loop", async (t) => {
@@ -204,7 +196,6 @@ test("a response not offered by the dialog cannot become an answer", async (t) =
   t.mock.method(globalThis, "fetch", async () => response(0.7));
   assertUnanswered(await h.execute());
   assert.equal(h.controller.isAwaitingHuman(), true);
-  assert.equal(h.enabled(), false);
 });
 
 test("stop invalidates a pending request even if fetch ignores cancellation", async (t) => {
@@ -256,7 +247,6 @@ test("stop while paused invalidates a late manual selection", async (t) => {
   waiting.resolve(dialog.options[1]);
   await delay(0);
   assert.equal(h.controller.isAwaitingHuman(), true);
-  assert.equal(h.enabled(), false);
 });
 
 test("a stale manual selection after reset does not restore the human gate", async (t) => {
@@ -295,7 +285,6 @@ test("context abort also invalidates a pending automatic judgment", async (t) =>
   assertUnanswered(await result);
   assert.equal(h.entries.length, 0);
   assert.equal(h.dialogs.length, 0);
-  assert.equal(h.enabled(), false);
 });
 
 test("concurrent direct executions fail closed instead of asking two questions", async (t) => {
@@ -310,7 +299,6 @@ test("concurrent direct executions fail closed instead of asking two questions",
   assert.equal(fetch.mock.callCount(), 1);
   assert.equal(h.dialogs.length, 0);
   assert.equal(h.entries.length, 0);
-  assert.equal(h.enabled(), false);
   assert.equal(h.controller.isAwaitingHuman(), true);
 });
 
@@ -319,11 +307,9 @@ test("HTTP errors pause for a manual answer without leaking exception credential
   t.mock.method(globalThis, "fetch", async () => { throw new Error("test-only-secret"); });
   const result = await h.execute();
   assertUnanswered(result);
-  assert.equal(h.pauses.length, 1);
   assert.equal(h.dialogs.length, 1);
-  assert.equal(h.enabled(), false);
   assert.equal(h.entries.length, 0);
-  assert.doesNotMatch(JSON.stringify({ result, pauses: h.pauses, dialogs: h.dialogs, entries: h.entries }), /test-only-secret/);
+  assert.doesNotMatch(JSON.stringify({ result, handoffs: h.handoffs, dialogs: h.dialogs, entries: h.entries }), /test-only-secret/);
 });
 
 test("dialog failure is unresolved rather than a guessed answer", async (t) => {
@@ -341,7 +327,6 @@ test("arguments mutated after host validation are rejected before HTTP or UI", a
   assertUnanswered(result);
   assert.equal(fetch.mock.callCount(), 0);
   assert.equal(h.dialogs.length, 0);
-  assert.equal(h.enabled(), false);
   assert.equal(h.controller.isAwaitingHuman(), true);
   assert.doesNotMatch(text(result), /x{1601}/);
 });
@@ -361,6 +346,5 @@ test("the HTTP deadline does not impose a deadline on human thinking", async (t)
   const answered = await result;
   assert.equal(answered.details.status, "answered");
   if (answered.details.status === "answered") assert.equal(answered.details.source, "human");
-  assert.equal(h.enabled(), false);
   waiting.resolve(response());
 });
