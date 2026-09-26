@@ -85,7 +85,7 @@ function harness(t: TestContext, flags: Record<string, string> = {}, mode: Exten
   emit("session_start", { reason: "startup" });
   t.after(() => { emit("session_shutdown"); });
   return {
-    ctx, sent, entries, emit, command, dialogOpened, noteOpened, customOpened,
+    pi, ctx, sent, entries, emit, command, dialogOpened, noteOpened, customOpened,
     setSelect(handler: (options: string[]) => Promise<string | undefined>) { select = handler; },
     setInput(handler: () => Promise<string | undefined>) { input = handler; },
     setCustom(handler: () => Promise<HumanAnswer | undefined>) { custom = handler; },
@@ -155,12 +155,12 @@ for (const source of ["interactive", "rpc"]) {
     assert.match(h.status(), /on 2\/2/);
     assert.equal(fetch.mock.callCount(), 3);
     assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
-    assert.match(h.status(), /off.*limit/);
+    assert.match(h.status(), /^Jev on\b.*limit/);
     assert.equal(fetch.mock.callCount(), 3, "A new conversation must not reset the continuation limit");
   });
 }
 
-for (const stop of ["command", "escape", "new session"] as const) {
+for (const stop of ["command", "new session"] as const) {
   test(`${stop} still disables automation while waiting after a Jev stop`, async (t) => {
     const h = harness(t, {}, "tui");
     const fetch = t.mock.method(globalThis, "fetch", async () => answer("other"));
@@ -168,7 +168,6 @@ for (const stop of ["command", "escape", "new session"] as const) {
     await h.emit("agent_before_settle", boundary());
     h.emit("agent_settled");
     if (stop === "command") await h.command("jev-off");
-    else if (stop === "escape") h.escape();
     else h.emit("session_start", { reason: "new" });
     h.emit("input", { source: "interactive", text: "Explain the parser." });
     assert.equal(h.emit("before_agent_start"), undefined);
@@ -178,7 +177,7 @@ for (const stop of ["command", "escape", "new session"] as const) {
   });
 }
 
-test("a host abort in the conversation after a Jev stop still disables automation", async (t) => {
+test("a host abort after a Jev stop waits for fresh input without disabling automation", async (t) => {
   const h = harness(t);
   const fetch = t.mock.method(globalThis, "fetch", async () => answer("other"));
   await h.command("jev-on", "Improve parser error handling");
@@ -189,7 +188,11 @@ test("a host abort in the conversation after a Jev stop still disables automatio
   h.emit("agent_settled");
   assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
   assert.equal(fetch.mock.callCount(), 1);
-  assert.match(h.status(), /off/);
+  assert.match(h.status(), /^Jev on\b/);
+  h.emit("input", { source: "rpc", text: "Continue checking." });
+  assert.ok(h.emit("before_agent_start"));
+  await h.emit("agent_before_settle", boundary());
+  assert.equal(fetch.mock.callCount(), 2);
 });
 
 test("permits the configured number of continuations then stops without another judgment", async (t) => {
@@ -204,7 +207,13 @@ test("permits the configured number of continuations then stops without another 
   }
   assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
   assert.equal(fetch.mock.callCount(), 2);
-  assert.match(h.status(), /off.*limit/);
+  assert.match(h.status(), /^Jev on\b.*limit/);
+  await h.command("jev-max", "3");
+  assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+  h.emit("input", { source: "rpc", text: "Run one more check." });
+  assert.ok(h.emit("before_agent_start"));
+  assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
+  assert.match(h.status(), /on 3\/3/);
 });
 
 test("manual stop cancels an in-flight judgment and late results cannot restart pi", async (t) => {
@@ -222,16 +231,24 @@ test("manual stop cancels an in-flight judgment and late results cannot restart 
   assert.match(h.status(), /off/);
 });
 
-test("Escape cancels Jev even while the provider turn is already complete", async (t) => {
+test("Escape cancels an in-flight judgment but fresh input can resume the same goal", async (t) => {
   const h = harness(t, {}, "tui");
   const waiting = deferred();
-  t.mock.method(globalThis, "fetch", () => waiting.promise);
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", () => ++calls === 1 ? waiting.promise : Promise.resolve(answer()));
   await h.command("jev-on", "Improve parser error handling");
   const result = h.emit("agent_before_settle", boundary());
   h.escape();
   waiting.resolve(answer());
   assert.equal(await result, undefined);
-  assert.match(h.status(), /off.*Escape/);
+  assert.match(h.status(), /^Jev on\b.*Escape/);
+  h.emit("agent_settled");
+  assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+  assert.equal(calls, 1, "A late judgment must not restart the cancelled run");
+  h.emit("input", { source: "interactive", text: "Continue checking the parser." });
+  assert.ok(h.emit("before_agent_start"));
+  assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
+  assert.match(h.status(), /on 1\/unlimited/);
 });
 
 test("a new session invalidates old judgments without rearming the startup goal", async (t) => {
@@ -254,7 +271,7 @@ test("interactive and RPC input take precedence over automation", async (t) => {
     await h.command("jev-on", "Improve parser error handling");
     h.emit("input", { source, text: "Stop and explain the changes" });
     assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
-    assert.match(h.status(), /off.*input/);
+    assert.match(h.status(), /^Jev on\b.*input/);
   }
   assert.equal(fetch.mock.callCount(), 0);
 });
@@ -268,7 +285,7 @@ test("queued input arriving during judgment prevents an automatic turn", async (
   h.setPending(true);
   waiting.resolve(answer());
   assert.equal(await result, undefined);
-  assert.match(h.status(), /off.*queued/);
+  assert.match(h.status(), /^Jev on\b.*queued/);
 });
 
 test("agent errors and aborts never become automatic retries", async (t) => {
@@ -277,19 +294,25 @@ test("agent errors and aborts never become automatic retries", async (t) => {
   for (const outcome of ["aborted", "error"] as const) {
     await h.command("jev-on", "Improve parser error handling");
     assert.equal(await h.emit("agent_before_settle", boundary(outcome)), undefined);
-    assert.match(h.status(), /off/);
+    assert.match(h.status(), /^Jev on\b/);
+    assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
   }
   assert.equal(fetch.mock.callCount(), 0);
 });
 
-test("a failed Jev request disables the loop rather than retrying", async (t) => {
+test("a failed Jev request waits without retrying and resumes only after fresh input", async (t) => {
   const h = harness(t);
-  const fetch = t.mock.method(globalThis, "fetch", async () => new Response(null, { status: 503 }));
+  let calls = 0;
+  const fetch = t.mock.method(globalThis, "fetch", async () => ++calls === 1 ? new Response(null, { status: 503 }) : answer());
   await h.command("jev-on", "Improve parser error handling");
   assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
   assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
   assert.equal(fetch.mock.callCount(), 1);
-  assert.match(h.status(), /off/);
+  assert.match(h.status(), /^Jev on\b/);
+  h.emit("input", { source: "rpc", text: "Try checking again." });
+  assert.ok(h.emit("before_agent_start"));
+  assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
+  assert.equal(fetch.mock.callCount(), 2);
 });
 
 test("missing credentials never start development or judging", async (t) => {
@@ -302,14 +325,14 @@ test("missing credentials never start development or judging", async (t) => {
   assert.equal(fetch.mock.callCount(), 0);
 });
 
-test("final settlement after a host abort disarms further automatic turns", async (t) => {
+test("final settlement after a host abort waits without automatically retrying", async (t) => {
   const h = harness(t);
   const fetch = t.mock.method(globalThis, "fetch", async () => answer());
   await h.command("jev-on", "Improve parser error handling");
   h.emit("agent_settled");
   assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
   assert.equal(fetch.mock.callCount(), 0);
-  assert.match(h.status(), /off/);
+  assert.match(h.status(), /^Jev on\b/);
 });
 
 test("an explicit command goal takes precedence over an unused startup goal", async (t) => {
@@ -374,7 +397,7 @@ test("an autonomous question returns the non-first choice without disabling the 
   assert.ok("source" in result.details && result.details.source === "jev");
   assert.ok("optionIndex" in result.details && result.details.optionIndex === 1);
   assert.notEqual(result.terminate, true);
-  assert.match(h.status(), /on/);
+  assert.match(h.status(), /^Jev on\b/);
 });
 
 for (const handoff of ["approval", "judgment", "HTTP error"] as const) {
@@ -410,13 +433,13 @@ for (const handoff of ["approval", "judgment", "HTTP error"] as const) {
     assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
     assert.match(h.status(), /on 2\/2/);
     assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
-    assert.match(h.status(), /off.*limit/);
+    assert.match(h.status(), /^Jev on\b.*limit/);
     assert.equal(fetch.mock.callCount(), callsBeforeAnswer + 1);
   });
 }
 
 for (const stop of ["command", "escape", "session switch"] as const) {
-  test(`${stop} during a human question prevents a late answer from re-enabling Jev`, async (t) => {
+  test(`${stop} during a human question rejects late answers and preserves the correct enabled state`, async (t) => {
     const h = harness(t, {}, stop === "escape" ? "tui" : "rpc");
     const selection = Promise.withResolvers<string | undefined>();
     const customAnswer = Promise.withResolvers<HumanAnswer | undefined>();
@@ -436,11 +459,19 @@ for (const stop of ["command", "escape", "session switch"] as const) {
     const result = await pending;
     assert.equal(result.terminate, true);
     h.emit("agent_settled");
-    assert.match(h.status(), /off/);
-    h.emit("input", { source: "rpc", text: "Explain the choices." });
-    assert.equal(h.emit("before_agent_start"), undefined);
+    assert.match(h.status(), stop === "escape" ? /^Jev on\b/ : /^Jev off\b/);
     assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
     assert.equal(fetch.mock.callCount(), 0);
+    h.emit("input", { source: "rpc", text: "Explain the choices." });
+    if (stop === "escape") {
+      assert.ok(h.emit("before_agent_start"));
+      assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
+      assert.equal(fetch.mock.callCount(), 1);
+    } else {
+      assert.equal(h.emit("before_agent_start"), undefined);
+      assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+      assert.equal(fetch.mock.callCount(), 0);
+    }
   });
 }
 
@@ -465,7 +496,7 @@ test("a dismissed human question keeps Jev enabled but gated until fresh input",
   assert.equal(h.aborts(), 1);
   await h.emit("agent_before_settle", boundary("aborted"));
   h.emit("agent_settled");
-  assert.match(h.status(), /on/);
+  assert.match(h.status(), /^Jev on\b/);
   assert.equal(fetch.mock.callCount(), 0);
   h.emit("input", { source: "rpc", text: "Use SQLite." });
   h.emit("before_agent_start");
@@ -487,7 +518,7 @@ test("unresolved approval blocks later tools until fresh human input", async (t)
   assert.equal(h.aborts(), 1);
   await h.emit("agent_before_settle", boundary("aborted"));
   h.emit("agent_settled");
-  assert.match(h.status(), /on/);
+  assert.match(h.status(), /^Jev on\b/);
   h.emit("input", { source: "interactive", text: "Use SQLite, without destructive changes." });
   assert.equal(h.emit("tool_call", { toolName: "bash", input: { command: "echo allowed" } }), undefined);
   h.emit("before_agent_start");
@@ -520,7 +551,7 @@ for (const [name, args] of [
     await h.command("jev-on", "Build an offline CLI");
     // pi emits this before its schema validation; execute is never called on rejection.
     h.emit("tool_execution_start", { toolName: "jev_choose", args });
-    assert.match(h.status(), /on/);
+    assert.match(h.status(), /^Jev on\b/);
     const blocked = h.emit("tool_call", { toolName: "write", input: { path: "forbidden.txt", content: "not approved" } });
     assert.ok(blocked && typeof blocked === "object" && "block" in blocked && blocked.block === true);
     h.emit("turn_end");
@@ -611,7 +642,7 @@ for (const enabled of [false, true]) {
     assert.ok(result.details && typeof result.details === "object" && "notes" in result.details);
     assert.equal(result.details.notes, "Keep data local.");
     assert.equal(h.emit("tool_call", { toolName: "write" }), undefined);
-    assert.match(h.status(), enabled ? /on/ : /off/);
+    assert.match(h.status(), enabled ? /^Jev on\b/ : /^Jev off\b/);
     assert.equal(fetch.mock.callCount(), 0);
   });
 }
@@ -634,3 +665,43 @@ for (const stop of ["command", "session switch"] as const) {
     assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
   });
 }
+
+test("report validation failure keeps the goal and counter for the next conversation", async (t) => {
+  const h = harness(t);
+  const states: { goal: string; iteration: number; previousReport: string | null }[] = [];
+  t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+    states.push(JSON.parse(String(init?.body)).state);
+    return answer();
+  });
+  await h.command("jev-max", "2");
+  await h.command("jev-on", "Improve parser error handling");
+  assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
+  const missingReport = boundary();
+  missingReport.context.contextMessages = [];
+  assert.equal(await h.emit("agent_before_settle", missingReport), undefined);
+  assert.match(h.status(), /^Jev on 1\/2/);
+  h.emit("agent_settled");
+  assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+  assert.equal(states.length, 1);
+  h.emit("input", { source: "rpc", text: "Continue with the report restored." });
+  assert.ok(h.emit("before_agent_start"));
+  assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
+  assert.equal(states[1]?.goal, "Improve parser error handling");
+  assert.equal(states[1]?.iteration, 2);
+  assert.equal(states[1]?.previousReport, "Implemented parser error handling. Next: run parser regression checks.");
+  assert.match(h.status(), /^Jev on 2\/2/);
+});
+
+test("failure to start a goal leaves it enabled but idle until the next user input", async (t) => {
+  const h = harness(t);
+  const send = t.mock.method(h.pi, "sendUserMessage", () => { throw new Error("Host refused to start"); });
+  const fetch = t.mock.method(globalThis, "fetch", async () => answer());
+  await h.command("jev-on", "Improve parser error handling");
+  assert.match(h.status(), /^Jev on\b/);
+  assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+  assert.equal(fetch.mock.callCount(), 0);
+  send.mock.restore();
+  h.emit("input", { source: "rpc", text: "Start now." });
+  assert.ok(h.emit("before_agent_start"));
+  assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
+});

@@ -44,7 +44,7 @@ function getJevOptions(signal: AbortSignal): JevRequestOptions {
 
 export default function jevContinue(pi: ExtensionAPI) {
   let enabled = false;
-  // 継続判定の正常停止・質問の人への委譲は、無効化せず入力を待つ。
+  // 実行停止と無効化は分離し、セッション内では /jev-off だけが有効状態を解除する。
   let waitingForInput = false;
   let goal = "";
   // count は最初の実行を除く自動継続回数。max === 0 は無制限。
@@ -85,7 +85,7 @@ export default function jevContinue(pi: ExtensionAPI) {
     pi.appendEntry("jev-continue-state", { enabled, count, max, reason });
     notify(ctx, status());
   };
-  const pause = (ctx: ExtensionContext, why: string) => {
+  const disable = (ctx: ExtensionContext, why: string) => {
     enabled = false;
     stopIteration(ctx, why);
   };
@@ -169,7 +169,7 @@ export default function jevContinue(pi: ExtensionAPI) {
     if (ctx.mode === "tui") {
       removeTerminalListener = ctx.ui.onTerminalInput((data) => {
         if (matchesKey(data, "escape") && (enabled || pendingGoal !== undefined || choiceTool.isPending())) {
-          pause(ctx, "Escape pressed");
+          stopIteration(ctx, "Escape pressed");
         }
         return undefined;
       });
@@ -177,10 +177,10 @@ export default function jevContinue(pi: ExtensionAPI) {
     updateStatus(ctx);
   });
 
-  // 実行中の人の入力は優先して解除する。正常停止・人への委譲後は有効なまま受け付ける。
+  // 人の入力は現在の自動処理より優先するが、有効状態と目標は維持する。
   pi.on("input", (event, ctx) => {
     if (event.source !== "extension") {
-      if (enabled && !waitingForInput) pause(ctx, "user input takes priority");
+      if (enabled && !waitingForInput) stopIteration(ctx, "user input takes priority");
       choiceTool.reset();
     }
     return { action: "continue" };
@@ -208,16 +208,16 @@ export default function jevContinue(pi: ExtensionAPI) {
   pi.on("agent_before_settle", async (event, ctx) => {
     if (!enabled || waitingForInput) return;
     if (event.outcome !== "completed" || ctx.signal?.aborted) {
-      pause(ctx, `agent ${event.outcome === "completed" ? "aborted" : event.outcome}`);
+      stopIteration(ctx, `agent ${event.outcome === "completed" ? "aborted" : event.outcome}`);
       return;
     }
     if (ctx.hasPendingMessages() || event.context.pendingMessages.length > 0) {
-      pause(ctx, "queued input takes priority");
+      stopIteration(ctx, "queued input takes priority");
       return;
     }
     if (event.continue) return;
     if (max > 0 && count >= max) {
-      pause(ctx, "continuation limit reached");
+      stopIteration(ctx, "continuation limit reached");
       return;
     }
     if (request) return;
@@ -244,12 +244,12 @@ export default function jevContinue(pi: ExtensionAPI) {
       // await 中に停止・新規開始・セッション切替が起きたら、通知もログも残さない。
       if (generation !== ticket || !enabled) return;
       if (signal.aborted) {
-        pause(ctx, "judgment cancelled or timed out");
+        stopIteration(ctx, "judgment cancelled or timed out");
         return;
       }
       // 判定中にもユーザー入力や上限変更が可能なので、実行直前に再確認する。
       if (ctx.hasPendingMessages()) {
-        pause(ctx, "queued input takes priority");
+        stopIteration(ctx, "queued input takes priority");
         return;
       }
       pi.appendEntry("jev-judgment", { iteration: count + 1, ...result });
@@ -258,7 +258,7 @@ export default function jevContinue(pi: ExtensionAPI) {
         return;
       }
       if (max > 0 && count >= max) {
-        pause(ctx, "continuation limit reached");
+        stopIteration(ctx, "continuation limit reached");
         return;
       }
       previousReport = state.latestReport;
@@ -280,7 +280,7 @@ export default function jevContinue(pi: ExtensionAPI) {
     } catch (error) {
       if (generation !== ticket || !enabled) return;
       const cancelled = signal.aborted;
-      pause(ctx, cancelled ? "judgment cancelled or timed out" : "Jev request or report validation failed");
+      stopIteration(ctx, cancelled ? "judgment cancelled or timed out" : "Jev request or report validation failed");
       if (!cancelled && error instanceof Error) notify(ctx, error.message, true);
     } finally {
       // 古い処理の finally で、新しい世代が開始したリクエストを消さない。
@@ -299,13 +299,13 @@ export default function jevContinue(pi: ExtensionAPI) {
       try {
         pi.sendUserMessage(`Work toward this goal:\n${goal}`);
       } catch {
-        pause(ctx, "pi could not start the goal");
+        stopIteration(ctx, "pi could not start the goal");
       }
     },
   });
   pi.registerCommand("jev-off", {
     description: "Disable Jev continuation and cancel any pending judgment",
-    handler: async (_args, ctx) => pause(ctx, "stopped by user"),
+    handler: async (_args, ctx) => disable(ctx, "stopped by user"),
   });
   pi.registerCommand("jev-status", {
     description: "Show Jev continuation state, goal, and JSONL log path",
@@ -338,16 +338,12 @@ export default function jevContinue(pi: ExtensionAPI) {
 
   pi.on("agent_settled", (_event, ctx) => {
     if (!enabled || waitingForInput) return;
-    // Pi の中断では before-settle が再度呼ばれない場合もあるため、最終通知でも解除する。
-    enabled = false;
-    cancelRequest();
-    reason = "pi settled without continuation";
-    updateStatus(ctx);
-    notify(ctx, status());
+    // Pi の中断では before-settle が再度呼ばれない場合もあるため、最終通知でも入力待ちにする。
+    stopIteration(ctx, "pi settled without continuation");
   });
 
   const leaveSession = (_event: unknown, ctx: ExtensionContext) => {
-    if (enabled || pendingGoal !== undefined) pause(ctx, "session or branch changing");
+    if (enabled || pendingGoal !== undefined) disable(ctx, "session or branch changing");
     else cancelRequest();
     choiceTool.reset();
   };

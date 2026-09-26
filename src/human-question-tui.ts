@@ -103,7 +103,7 @@ export async function showHumanQuestionTui(
           selected = Math.max(0, selected - 1);
           reveal = "option";
         } else if (keybindings.matches(data, "tui.select.down")) {
-          selected = Math.min(options.length - 1, selected + 1);
+          selected = Math.min(options.length, selected + 1);
           reveal = "option";
         } else if (keybindings.matches(data, "tui.select.pageUp")) {
           scroll = Math.max(0, scroll - pageSize);
@@ -111,14 +111,16 @@ export async function showHumanQuestionTui(
         } else if (keybindings.matches(data, "tui.select.pageDown")) {
           scroll += pageSize;
           reveal = undefined;
-        } else if (data === "n") {
-          editing = true;
-          editor.setText(notes ?? "");
-          editor.focused = focused;
-          error = "";
         } else if (keybindings.matches(data, "tui.select.confirm")) {
-          finish(notes ? { optionIndex: selected, notes } : { optionIndex: selected });
-          return;
+          if (selected === options.length) {
+            editing = true;
+            editor.setText(notes ?? "");
+            editor.focused = focused;
+            error = "";
+          } else {
+            finish(notes ? { optionIndex: selected, notes } : { optionIndex: selected });
+            return;
+          }
         }
         refresh();
       }
@@ -131,15 +133,15 @@ export async function showHumanQuestionTui(
         const keys = (binding: Keybinding) => keybindings.getKeys(binding).join("/");
         const hints = editing
           ? `${keys("tui.input.submit")} save note (not answer) · ${keys("tui.input.newLine")} newline · Esc cancel`
-          : `${keys("tui.select.up")}/${keys("tui.select.down")} choose · ${keys("tui.select.confirm")} submit · n note · ${keys("tui.select.pageUp")}/${keys("tui.select.pageDown")} scroll · Esc cancel`;
+          : `${keys("tui.select.up")}/${keys("tui.select.down")} choose · ${keys("tui.select.confirm")} ${selected === options.length ? "edit note" : "submit answer"} · ${keys("tui.select.pageUp")}/${keys("tui.select.pageDown")} scroll · Esc cancel`;
         const hintLines = wrap(theme.fg("dim", hints));
         // Keep hints available even when the terminal is unusually short or narrow.
         const footer = hintLines.length <= Math.floor(height / 3)
           ? hintLines
-          : [theme.fg("dim", truncateToWidth(editing ? "Enter save · Esc cancel" : "Enter submit · n note · Esc cancel", columns))];
+          : [theme.fg("dim", truncateToWidth(editing ? "Enter save · Esc cancel" : selected === options.length ? "Enter edit note · Esc cancel" : "Enter submit · Esc cancel", columns))];
         const status = editing
           ? `Optional note (${editor.getExpandedText().trim().length}/${prompt.notesLimit})`
-          : `Selected: ${selected + 1}. ${options[selected]!.label}${notes ? " · Note attached" : ""}`;
+          : `Selected: ${selected === options.length ? "Add/edit note (optional; not an answer)" : `${selected + 1}. ${options[selected]!.label}`}${notes ? " · Note attached" : ""}`;
         footer.unshift(theme.fg("accent", truncateToWidth(status.replace(/\n/g, " "), columns)));
 
         if (editing) {
@@ -178,7 +180,10 @@ export async function showHumanQuestionTui(
           lines.push("");
         }
         const noteLine = lines.length;
-        section("Optional note", notes ? displayText(notes) : theme.fg("dim", "None. Press n to add a note to your selected option."));
+        optionLines.push(noteLine);
+        add(theme.fg(selected === options.length ? "accent" : "text", `${selected === options.length ? ">" : " "} Add/edit note (optional; not an answer)`));
+        add(theme.fg("muted", "Select to add or edit a note, then choose an answer above."));
+        if (notes) add(displayText(notes));
         pageSize = Math.max(1, height - footer.length - 1);
         if (reveal) {
           const target = reveal === "note" ? noteLine : optionLines[selected]!;
