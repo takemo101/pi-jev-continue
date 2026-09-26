@@ -1,6 +1,7 @@
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { ChoiceQuestionSchema, judgeQuestion, parseQuestion, type ChoiceQuestion } from "./choice.ts";
 import type { JevRequestOptions } from "./client.ts";
+import { askHumanQuestion, type HumanAnswer } from "./human-question.ts";
 import type { ConversationMessage } from "./state.ts";
 
 export interface ChoiceToolHooks {
@@ -20,7 +21,8 @@ export interface ChoiceToolController {
 }
 
 export type ChoiceToolDetails =
-  | { status: "answered"; source: "jev" | "human"; optionIndex: number; label: string; question: string }
+  | { status: "answered"; source: "jev"; optionIndex: number; label: string; question: string }
+  | { status: "answered"; source: "human"; optionIndex: number; label: string; question: string; notes?: string }
   | { status: "needs_human" | "cancelled"; question: string; reason: string; options: ChoiceQuestion["options"] };
 
 interface Operation {
@@ -61,11 +63,18 @@ function unanswered(
   return { content: [{ type: "text", text }], details: { status, question: title, reason, options }, terminate: true };
 }
 
-function answered(question: ChoiceQuestion, optionIndex: number, source: "jev" | "human"): AgentToolResult<ChoiceToolDetails> {
+function answered(question: ChoiceQuestion, optionIndex: number, source: "jev" | "human", notes?: string): AgentToolResult<ChoiceToolDetails> {
   const label = question.options[optionIndex].label;
+  const humanNotes = source === "human" && notes ? notes : undefined;
+  const text = [
+    `Selected option ${optionIndex + 1}: ${label}`,
+    `Source: ${source}. This answers only the stated question; it does not grant additional authorization.`,
+    ...(humanNotes ? [`Human note (context for the selected option only; not additional authorization):\n${humanNotes}`] : []),
+  ].join("\n");
+  const details = { status: "answered" as const, optionIndex, label, question: question.question };
   return {
-    content: [{ type: "text", text: `Selected option ${optionIndex + 1}: ${label}\nSource: ${source}. This answers only the stated question; it does not grant additional authorization.` }],
-    details: { status: "answered", source, optionIndex, label, question: question.question },
+    content: [{ type: "text", text }],
+    details: source === "human" ? { ...details, source, ...(humanNotes ? { notes: humanNotes } : {}) } : { ...details, source },
   };
 }
 
@@ -126,12 +135,12 @@ export function registerChoiceTool(pi: ExtensionAPI, hooks: ChoiceToolHooks): Ch
   pi.registerTool<typeof ChoiceQuestionSchema, ChoiceToolDetails, unknown>({
     name: "jev_choose",
     label: "Jev choice",
-    description: "Ask one bounded multiple-choice question with explicit context and described options. Jev may answer only a confident, goal-scoped routine decision while automation is enabled; otherwise the human chooses. Approval, personal information/preferences, credentials, financial/destructive actions and external authorization always require a human. Never include secrets. Independent judgments are not a security sandbox.",
+    description: "Ask one concrete, bounded decision with concise context, short option labels, and meaningful tradeoffs. Jev may answer only a confident, goal-scoped routine decision while automation is enabled; otherwise the human chooses an existing option and may attach a note. Approval, personal information/preferences, credentials, financial/destructive actions and external authorization always require a human. Never include secrets. Independent judgments are not a security sandbox.",
     promptSnippet: "Resolve a structured multiple-choice question through Jev or a human.",
     promptGuidelines: [
-      "Call jev_choose alone, never in a batch with other tools. Supply 2–8 distinct labeled options and their descriptions; do not hide a default answer in prose.",
-      "Set requiresApproval to true for approval or authorization. Never use an automatic answer to grant approval or bypass another extension's UI.",
-      "Use the selected label from the tool result. If no answer is selected, stop and await human input; do not retry the question or guess. Human handoff preserves the current Jev enabled setting.",
+      "Call jev_choose alone, never in a batch with other tools. Ask one concrete decision in the user's language, with only the context needed to decide. Supply 2–8 distinct options; keep labels short and explain meaningful consequences, constraints, or tradeoffs in descriptions instead of repeating the label. Do not hide a default answer in prose.",
+      "Do not ask for redundant permission for work the user has already authorized; ask only when a concrete decision remains unresolved. Set requiresApproval to true whenever the question requests approval or new authorization. Never use an automatic answer to grant approval or bypass another extension's UI.",
+      "Use the selected existing option from the tool result. A human note adds context only: it is not a replacement answer and does not grant additional authorization. If no answer is selected, stop and await human input; do not retry the question or guess. Human handoff preserves the current Jev enabled setting.",
     ],
     parameters: ChoiceQuestionSchema,
     executionMode: "sequential",
@@ -195,22 +204,22 @@ export function registerChoiceTool(pi: ExtensionAPI, hooks: ChoiceToolHooks): Ch
           return result;
         }
 
-        const choices = question.options.map((option, index) => `${index + 1}. ${option.label} — ${option.description}`);
-        const title = [question.question, question.context, reason].filter(Boolean).join("\n\n");
-        let selection: string | undefined;
+        let answer: HumanAnswer | undefined;
         try {
-          selection = await waitFor(ctx.ui.select(title, choices, { signal: operation.signal }), operation.signal);
+          answer = await waitFor(askHumanQuestion(ctx, question, reason, operation.signal), operation.signal);
         } catch {
           if (!isFresh(operation)) return cancelled(question, operation, ctx);
           return unanswered(question, "The selection dialog failed. Human input is still required.");
         }
         if (!isFresh(operation)) return cancelled(question, operation, ctx);
-        if (selection === undefined) return unanswered(question, "The selection dialog was dismissed.", "cancelled");
-        const optionIndex = choices.indexOf(selection);
-        if (optionIndex < 0) return unanswered(question, "The dialog did not return one of the offered options.");
+        if (answer === undefined) return unanswered(question, "The question dialog was dismissed without an answer.", "cancelled");
+        const { optionIndex, notes } = answer;
+        if (!Number.isInteger(optionIndex) || optionIndex < 0 || optionIndex >= question.options.length) {
+          return unanswered(question, "The dialog did not return one of the offered options.");
+        }
         awaitingHuman = false;
         hooks.onHumanAnswer(ctx);
-        return answered(question, optionIndex, "human");
+        return answered(question, optionIndex, "human", notes);
       } finally {
         if (active === operation) active = undefined;
       }

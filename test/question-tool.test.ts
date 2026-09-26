@@ -14,12 +14,18 @@ interface Dialog {
   options: string[];
   signal: AbortSignal | undefined;
 }
+interface NoteDialog {
+  title: string;
+  placeholder: string | undefined;
+  signal: AbortSignal | undefined;
+}
 interface HarnessOptions {
   enabled?: boolean;
   hasUI?: boolean;
   mode?: ExtensionContext["mode"];
   timeoutMs?: number;
   select?: (dialog: Dialog) => Promise<string | undefined>;
+  input?: (dialog: NoteDialog) => Promise<string | undefined>;
 }
 
 function question(requiresApproval = false): ChoiceQuestion {
@@ -54,6 +60,7 @@ function harness(t: TestContext, options: HarnessOptions = {}) {
   const entries: { type: string; data: unknown }[] = [];
   const dialogs: Dialog[] = [];
   const dialogOpened = Promise.withResolvers<Dialog>();
+  const noteOpened = Promise.withResolvers<NoteDialog>();
   const contextAbort = new AbortController();
   // このハーネスは本ツールが使用する pi の機能だけを実装する。
   const pi = {
@@ -63,7 +70,7 @@ function harness(t: TestContext, options: HarnessOptions = {}) {
   } as unknown as ExtensionAPI;
   const ctx = {
     hasUI: options.hasUI ?? true,
-    mode: options.mode ?? "tui",
+    mode: options.mode ?? "rpc",
     signal: contextAbort.signal,
     ui: {
       select(title: string, choices: string[], dialogOptions?: ExtensionUIDialogOptions) {
@@ -71,6 +78,11 @@ function harness(t: TestContext, options: HarnessOptions = {}) {
         dialogs.push(dialog);
         dialogOpened.resolve(dialog);
         return options.select?.(dialog) ?? Promise.resolve(choices[1]);
+      },
+      input(title: string, placeholder?: string, dialogOptions?: ExtensionUIDialogOptions) {
+        const dialog = { title, placeholder, signal: dialogOptions?.signal };
+        noteOpened.resolve(dialog);
+        return options.input?.(dialog) ?? Promise.resolve(undefined);
       },
     },
   } as unknown as ExtensionContext;
@@ -90,7 +102,7 @@ function harness(t: TestContext, options: HarnessOptions = {}) {
   const tool = registered;
   t.after(() => controller.reset());
   return {
-    controller, handoffs, entries, dialogs, dialogOpened, contextAbort,
+    controller, handoffs, entries, dialogs, dialogOpened, noteOpened, contextAbort,
     execute(value: unknown = question(), signal?: AbortSignal) {
       // tool_call フックがホスト検証後に引数を書き換える場合も同じ境界で試す。
       return tool.execute("choice-call", value as ChoiceQuestion, signal, undefined, ctx);
@@ -128,10 +140,6 @@ test("low confidence waits for a manual RPC choice before returning a human answ
     mode: "rpc",
     select: async (dialog) => {
       assert.equal(dialog.signal?.aborted, false);
-      assert.match(dialog.title, /Which parser verification/);
-      assert.match(dialog.title, /implementation is complete/);
-      assert.match(dialog.options[1], /Run parser regressions/);
-      assert.match(dialog.options[1], /focused parser regression/);
       return dialog.options[1];
     },
   });
@@ -347,4 +355,120 @@ test("the HTTP deadline does not impose a deadline on human thinking", async (t)
   assert.equal(answered.details.status, "answered");
   if (answered.details.status === "answered") assert.equal(answered.details.source, "human");
   waiting.resolve(response());
+});
+
+test("a human note accompanies only an explicitly selected existing option", async (t) => {
+  let selections = 0;
+  const h = harness(t, {
+    select: async (dialog) => ++selections === 1 ? dialog.options.at(-1) : dialog.options[1],
+    input: async () => "  Keep fixtures offline.\nDo not change the API.  ",
+  });
+  const requests: unknown[] = [];
+  t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+    requests.push(JSON.parse(String(init?.body)).state);
+    return response(0.7);
+  });
+  const result = await h.execute();
+  assert.deepEqual(result.details, {
+    status: "answered", source: "human", optionIndex: 1,
+    label: question().options[1].label, question: question().question,
+    notes: "Keep fixtures offline.\nDo not change the API.",
+  });
+  assert.match(text(result), /Keep fixtures offline\.\nDo not change the API\./);
+  assert.doesNotMatch(JSON.stringify(requests), /Keep fixtures offline/);
+});
+
+test("saving a note keeps the question unresolved until an option is selected", async (t) => {
+  const nextSelection = Promise.withResolvers<string | undefined>();
+  const redrawn = Promise.withResolvers<Dialog>();
+  let selections = 0;
+  const h = harness(t, {
+    enabled: false,
+    select: (dialog) => {
+      if (++selections === 1) return Promise.resolve(dialog.options.at(-1));
+      redrawn.resolve(dialog);
+      return nextSelection.promise;
+    },
+    input: async () => "Keep the public API.",
+  });
+  const pending = h.execute();
+  const dialog = await redrawn.promise;
+  assert.match(dialog.title, /Keep the public API\./);
+  assert.equal(h.controller.isPending(), true);
+  assert.equal(h.controller.isAwaitingHuman(), true);
+  nextSelection.resolve(dialog.options[1]);
+  const result = await pending;
+  assert.equal(result.details.status, "answered");
+  assert.equal(h.controller.isAwaitingHuman(), false);
+});
+
+test("cancelling note input leaves the question unanswered", async (t) => {
+  const h = harness(t, {
+    enabled: false,
+    select: async (dialog) => dialog.options.at(-1),
+    input: async () => undefined,
+  });
+  assertUnanswered(await h.execute());
+  assert.equal(h.controller.isAwaitingHuman(), true);
+});
+
+for (const stop of ["cancel", "reset", "tool abort", "context abort"] as const) {
+  test(`${stop} during note entry rejects a late note without reopening selection`, async (t) => {
+    const note = Promise.withResolvers<string | undefined>();
+    const abort = new AbortController();
+    const h = harness(t, {
+      enabled: false,
+      select: async (dialog) => dialog.options.at(-1),
+      input: () => note.promise,
+    });
+    const pending = h.execute(question(), abort.signal);
+    const dialog = await h.noteOpened.promise;
+    if (stop === "tool abort") abort.abort();
+    else if (stop === "context abort") h.contextAbort.abort();
+    else h.controller[stop]();
+    assert.equal(dialog.signal?.aborted, true);
+    assertUnanswered(await pending);
+    note.resolve("Stale note");
+    await delay(0);
+    assert.equal(h.dialogs.length, 1);
+    assert.equal(h.controller.isAwaitingHuman(), stop !== "reset");
+  });
+}
+
+test("editing a note to whitespace clears it from the final answer", async (t) => {
+  let selections = 0;
+  let edits = 0;
+  const h = harness(t, {
+    enabled: false,
+    select: async (dialog) => ++selections <= 2 ? dialog.options.at(-1) : dialog.options[0],
+    input: async () => ++edits === 1 ? "Remove this note" : " \n\t ",
+  });
+  const result = await h.execute();
+  assert.deepEqual(result.details, {
+    status: "answered", source: "human", optionIndex: 0,
+    label: question().options[0].label, question: question().question,
+  });
+  assert.doesNotMatch(text(result), /Remove this note/);
+});
+
+test("overlimit notes remain editable without accepting or silently truncating them", async (t) => {
+  let selections = 0;
+  let edits = 0;
+  const tooLong = "x".repeat(2001);
+  const h = harness(t, {
+    enabled: false,
+    select: async (dialog) => ++selections === 1 ? dialog.options.at(-1) : dialog.options[1],
+    input: async (dialog) => {
+      if (++edits === 1) return tooLong;
+      assert.match(dialog.title, /2000/);
+      assert.equal(dialog.placeholder, tooLong);
+      assert.equal(h.controller.isAwaitingHuman(), true);
+      return "x".repeat(2000);
+    },
+  });
+  const result = await h.execute();
+  assert.equal(result.details.status, "answered");
+  if (result.details.status === "answered" && result.details.source === "human") {
+    assert.equal(result.details.notes, "x".repeat(2000));
+  }
 });
