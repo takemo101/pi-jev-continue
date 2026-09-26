@@ -44,6 +44,8 @@ function getJevOptions(signal: AbortSignal): JevRequestOptions {
 
 export default function jevContinue(pi: ExtensionAPI) {
   let enabled = false;
+  // Jev の正常な停止は無効化ではなく、次の会話を待つ状態。
+  let waitingForInput = false;
   let goal = "";
   // count は最初の実行を除く自動継続回数。max === 0 は無制限。
   let count = 0;
@@ -69,18 +71,23 @@ export default function jevContinue(pi: ExtensionAPI) {
   // 停止・再開・セッション切替は必ずここを通し、処理中の結果を無効化する。
   const cancelRequest = () => {
     generation += 1;
+    waitingForInput = false;
     request?.abort();
     request = undefined;
     choiceTool.cancel();
   };
-  const pause = (ctx: ExtensionContext, why: string) => {
-    enabled = false;
+  const stopIteration = (ctx: ExtensionContext, why: string) => {
     pendingGoal = undefined;
     reason = why;
     cancelRequest();
+    waitingForInput = enabled;
     updateStatus(ctx);
     pi.appendEntry("jev-continue-state", { enabled, count, max, reason });
     notify(ctx, status());
+  };
+  const pause = (ctx: ExtensionContext, why: string) => {
+    enabled = false;
+    stopIteration(ctx, why);
   };
   const activate = (text: string, ctx: ExtensionContext): boolean => {
     const nextGoal = text.trim();
@@ -164,10 +171,10 @@ export default function jevContinue(pi: ExtensionAPI) {
     updateStatus(ctx);
   });
 
-  // extension 自身が送った開始メッセージでは停止せず、人の入力だけを優先する。
+  // 実行中の人の入力は優先して解除する。Jev の正常な停止後は、有効なまま次の会話を受け付ける。
   pi.on("input", (event, ctx) => {
     if (event.source !== "extension") {
-      if (enabled) pause(ctx, "user input takes priority");
+      if (enabled && !waitingForInput) pause(ctx, "user input takes priority");
       choiceTool.reset();
     }
     return { action: "continue" };
@@ -180,6 +187,9 @@ export default function jevContinue(pi: ExtensionAPI) {
       activate(text, ctx);
     }
     if (!enabled) return;
+    waitingForInput = false;
+    reason = "working";
+    updateStatus(ctx);
     return {
       message: {
         customType: "jev-directive",
@@ -190,7 +200,7 @@ export default function jevContinue(pi: ExtensionAPI) {
   });
 
   pi.on("agent_before_settle", async (event, ctx) => {
-    if (!enabled) return;
+    if (!enabled || waitingForInput) return;
     if (event.outcome !== "completed" || ctx.signal?.aborted) {
       pause(ctx, `agent ${event.outcome === "completed" ? "aborted" : event.outcome}`);
       return;
@@ -238,7 +248,7 @@ export default function jevContinue(pi: ExtensionAPI) {
       }
       pi.appendEntry("jev-judgment", { iteration: count + 1, ...result });
       if (result.action === "stop") {
-        pause(ctx, result.reason);
+        stopIteration(ctx, result.reason);
         return;
       }
       if (max > 0 && count >= max) {
@@ -321,7 +331,7 @@ export default function jevContinue(pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", (_event, ctx) => {
-    if (!enabled) return;
+    if (!enabled || waitingForInput) return;
     // Pi の中断では before-settle が再度呼ばれない場合もあるため、最終通知でも解除する。
     enabled = false;
     cancelRequest();
