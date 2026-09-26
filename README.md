@@ -15,7 +15,13 @@ Jev の判定で pi の開発ループを継続する extension。実装・調�
 
 ## インストール
 
-このディレクトリの親から実行します。
+GitHub から直接インストールできます。
+
+```bash
+pi install git:github.com/takemo101/pi-jev-continue
+```
+
+ローカルに取得済みの場合は、このディレクトリの親から実行します。
 
 ```bash
 pi install ./pi-jev-continue
