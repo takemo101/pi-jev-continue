@@ -79,6 +79,7 @@ test("extracts report text and tool text without thinking, arguments, images, or
     goal: "Goal",
     latestReport: "Implemented feature.\nVerified behavior.",
     previousReport: "Earlier report",
+    conversation: [{ role: "user", text: "Implement the requested feature" }],
     recentTools: [{ name: "read", isError: false, output: "Textual evidence", truncated: false }],
     iteration: 3,
   });
@@ -138,4 +139,41 @@ test("excludes tool results from before the newest user message even when fewer 
 test("rejects an oversized combined state including multibyte text", () => {
   assert.throws(() => buildState("Goal", [assistant("日".repeat(9000))], null, 1));
   assert.throws(() => buildState("Goal", [assistant("x".repeat(12000))], "y".repeat(12000), 2));
+});
+
+test("includes the last ten public conversation messages before the current report", () => {
+  const messages: AgentMessage[] = Array.from({ length: 14 }, (_, index) =>
+    index % 2 === 0 ? { role: "user", content: `Constraint ${index}`, timestamp: index } : assistant(`Proposal ${index}`),
+  );
+  const state = buildState("Goal", [...messages, assistant("Current report")], null, 1);
+  assert.deepEqual(state.conversation, Array.from({ length: 10 }, (_, offset) => {
+    const index = offset + 4;
+    return { role: index % 2 === 0 ? "user" : "assistant", text: `${index % 2 === 0 ? "Constraint" : "Proposal"} ${index}` };
+  }));
+});
+
+test("conversation excludes non-public blocks and does not let empty messages consume the limit", () => {
+  const mixed = assistant("unused", "toolUse");
+  mixed.content = [
+    { type: "thinking", thinking: "private reasoning" },
+    { type: "text", text: "Proposed approach" },
+    { type: "toolCall", id: "call", name: "read", arguments: { secret: "private argument" } },
+  ];
+  const hidden = assistant(" \n ");
+  hidden.content.push({ type: "thinking", thinking: "more private reasoning" });
+  const messages: AgentMessage[] = [
+    { role: "user", content: [{ type: "text", text: "Do not use SQLite" }, { type: "image", data: "private image", mimeType: "image/png" }], timestamp: 0 },
+    mixed, tool("read", "private tool output"), hidden, assistant("Current report"),
+  ];
+  assert.deepEqual(buildState("Goal", messages, null, 1, 2).conversation, [
+    { role: "user", text: "Do not use SQLite" },
+    { role: "assistant", text: "Proposed approach" },
+  ]);
+  assert.deepEqual(buildState("Goal", messages, null, 1, 0).conversation, []);
+});
+
+test("oversized selected history rejects instead of dropping or clipping user constraints", () => {
+  const history: AgentMessage[] = [{ role: "user", content: "制".repeat(8000), timestamp: 0 }, assistant("Current report")];
+  assert.throws(() => buildState("Goal", history, null, 1), /byte.*budget/);
+  assert.equal(buildState("Goal", history, null, 1, 0).latestReport, "Current report");
 });

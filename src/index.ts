@@ -3,8 +3,9 @@ import type { AgentBeforeSettleEventResult, ExtensionAPI, ExtensionContext } fro
 import { matchesKey } from "@earendil-works/pi-tui";
 import type { JevRequestOptions } from "./client.ts";
 import { judge } from "./jev.ts";
-import { buildState, INPUT_LIMITS } from "./state.ts";
+import { buildState, DEFAULT_HISTORY_COUNT, extractConversation, INPUT_LIMITS } from "./state.ts";
 import { registerChoiceTool } from "./question-tool.ts";
+import { getJevLogPath } from "./request-log.ts";
 
 const DEFAULT_MODEL = "jev-1.13.0";
 const JUDGMENT_TIMEOUT_MS = 30_000;
@@ -26,8 +27,8 @@ const ACTIONS = {
   improve: "Make the concrete, goal-scoped improvement proposed in your last report; verify its effect.",
 } as const;
 
-/** 0 は無制限。parseInt のように小数や末尾の文字を黙って受け入れない。 */
-function parseContinuationLimit(value: string): number | undefined {
+/** 小数や末尾の文字を黙って受け入れず、件数設定を共通の形式で検証する。 */
+function parseNonNegativeInteger(value: string): number | undefined {
   if (!/^\d+$/.test(value)) return undefined;
   const limit = Number(value);
   return Number.isSafeInteger(limit) ? limit : undefined;
@@ -47,6 +48,7 @@ export default function jevContinue(pi: ExtensionAPI) {
   // count は最初の実行を除く自動継続回数。max === 0 は無制限。
   let count = 0;
   let max = 0;
+  let historyCount = DEFAULT_HISTORY_COUNT;
   let reason = "not started";
   let previousReport: string | null = null;
   // 中断だけでは応答到着と競合し得るため、世代番号でも古い結果の適用を防ぐ。
@@ -106,6 +108,7 @@ export default function jevContinue(pi: ExtensionAPI) {
 
   const choiceTool = registerChoiceTool(pi, {
     getGoal: () => enabled ? goal : undefined,
+    getConversation: (ctx) => historyCount === 0 ? [] : extractConversation(ctx.sessionManager.buildSessionProjection().messages, historyCount),
     getRequestOptions: getJevOptions,
     pause,
     timeoutMs: JUDGMENT_TIMEOUT_MS,
@@ -123,6 +126,7 @@ export default function jevContinue(pi: ExtensionAPI) {
 
   pi.registerFlag("jev-goal", { type: "string", description: "Enable Jev continuation for this goal on the first prompt" });
   pi.registerFlag("jev-max", { type: "string", default: "0", description: "Maximum Jev continuations; 0 means unlimited" });
+  pi.registerFlag("jev-history", { type: "string", default: String(DEFAULT_HISTORY_COUNT), description: "Recent public conversation messages sent to Jev; 0 disables history" });
 
   pi.on("session_start", (event, ctx) => {
     cancelRequest();
@@ -133,16 +137,19 @@ export default function jevContinue(pi: ExtensionAPI) {
     goal = "";
     count = 0;
     max = 0;
+    historyCount = DEFAULT_HISTORY_COUNT;
     reason = "session started; explicit activation required";
     previousReport = null;
     pendingGoal = undefined;
     if (event.reason === "startup") {
       const flagGoal = pi.getFlag("jev-goal");
-      const flagMax = parseContinuationLimit(String(pi.getFlag("jev-max") ?? "0"));
-      if (flagMax === undefined) {
-        notify(ctx, "Invalid --jev-max: use a non-negative integer. Automation is disabled.", true);
+      const flagMax = parseNonNegativeInteger(String(pi.getFlag("jev-max") ?? "0"));
+      const flagHistory = parseNonNegativeInteger(String(pi.getFlag("jev-history") ?? DEFAULT_HISTORY_COUNT));
+      if (flagMax === undefined || flagHistory === undefined) {
+        notify(ctx, `Invalid --jev-${flagMax === undefined ? "max" : "history"}: use a non-negative integer. Automation is disabled.`, true);
       } else {
         max = flagMax;
+        historyCount = flagHistory;
         if (typeof flagGoal === "string") pendingGoal = flagGoal;
       }
     }
@@ -216,7 +223,7 @@ export default function jevContinue(pi: ExtensionAPI) {
     reason = "judging";
     updateStatus(ctx);
     try {
-      const state = buildState(goal, messages, previousReport, count + 1);
+      const state = buildState(goal, messages, previousReport, count + 1, historyCount);
       const result = await judge(state, getJevOptions(signal));
       // await 中に停止・新規開始・セッション切替が起きたら、通知もログも残さない。
       if (generation !== ticket || !enabled) return;
@@ -285,19 +292,31 @@ export default function jevContinue(pi: ExtensionAPI) {
     handler: async (_args, ctx) => pause(ctx, "stopped by user"),
   });
   pi.registerCommand("jev-status", {
-    description: "Show Jev continuation state and goal",
-    handler: async (_args, ctx) => notify(ctx, `${status()}${goal ? `\nGoal: ${goal}` : ""}`),
+    description: "Show Jev continuation state, goal, and JSONL log path",
+    handler: async (_args, ctx) => notify(ctx, `${status()}${goal ? `\nGoal: ${goal}` : ""}\nHistory messages: ${historyCount}\nJSONL log: ${getJevLogPath()}`),
   });
   pi.registerCommand("jev-max", {
     description: "Set continuation limit: /jev-max <integer>; 0 means unlimited",
     handler: async (args, ctx) => {
-      const value = parseContinuationLimit(args.trim());
+      const value = parseNonNegativeInteger(args.trim());
       if (value === undefined) {
         notify(ctx, "Usage: /jev-max <non-negative integer>; 0 means unlimited", true);
         return;
       }
       max = value;
       updateStatus(ctx);
+    },
+  });
+  pi.registerCommand("jev-history", {
+    description: "Set recent conversation message count sent to Jev; 0 disables history",
+    handler: async (args, ctx) => {
+      const value = parseNonNegativeInteger(args.trim());
+      if (value === undefined) {
+        notify(ctx, "Usage: /jev-history <non-negative integer>; 0 disables history", true);
+        return;
+      }
+      historyCount = value;
+      notify(ctx, `Jev history: ${historyCount} messages. Applies to subsequent requests.`);
     },
   });
 

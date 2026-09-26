@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { judgeQuestion, parseQuestion, type ChoiceQuestion } from "../src/choice.ts";
+import { isolateJevLogs } from "./log-environment.ts";
+
+isolateJevLogs();
 
 const goal = "Improve error messages in the local parser without changing its grammar.";
 const question: ChoiceQuestion = {
@@ -33,14 +36,14 @@ function fixture(choice = "option_1", confidence = 0.95, human = 0, scopes = [0,
 // 固定応答で制御方針を検証する。実モデルの正答率や注入耐性を証明するテストではない。
 test("answers a non-first option when only that option fits the goal", async (t) => {
   t.mock.method(globalThis, "fetch", async () => Response.json(fixture()));
-  const result = await judgeQuestion(goal, question, requestOptions);
+  const result = await judgeQuestion({ goal, question, conversation: [] }, requestOptions);
   assert.equal(result.action, "answer");
   if (result.action === "answer") assert.equal(result.optionIndex, 1);
 });
 
 test("accepts inclusive confidence, human, and selected-scope boundaries", async (t) => {
   t.mock.method(globalThis, "fetch", async () => Response.json(fixture("option_1", 0.85, 0.1, [0, 0.9])));
-  assert.equal((await judgeQuestion(goal, question, requestOptions)).action, "answer");
+  assert.equal((await judgeQuestion({ goal, question, conversation: [] }, requestOptions)).action, "answer");
 });
 
 for (const scenario of [
@@ -52,7 +55,7 @@ for (const scenario of [
 ]) {
   test(`defers for ${scenario.name}`, async (t) => {
     t.mock.method(globalThis, "fetch", async () => Response.json(scenario.body));
-    const result = await judgeQuestion(goal, question, requestOptions);
+    const result = await judgeQuestion({ goal, question, conversation: [] }, requestOptions);
     assert.equal(result.action, "defer");
     assert.match(result.reason, scenario.reason);
   });
@@ -60,7 +63,7 @@ for (const scenario of [
 
 test("explicit approval defers without contacting Jev", async (t) => {
   const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(fixture()));
-  const result = await judgeQuestion(goal, { ...question, requiresApproval: true }, requestOptions);
+  const result = await judgeQuestion({ goal, question: { ...question, requiresApproval: true }, conversation: [] }, requestOptions);
   assert.equal(result.action, "defer");
   assert.equal(result.model, null);
   assert.equal(fetchMock.mock.callCount(), 0);
@@ -76,7 +79,7 @@ test("injection-shaped labels remain option data rather than response keys", asy
   };
   t.mock.method(globalThis, "fetch", async () => Response.json(fixture()));
   const parsed = parseQuestion(injected);
-  const result = await judgeQuestion(goal, parsed, requestOptions);
+  const result = await judgeQuestion({ goal, question: parsed, conversation: [] }, requestOptions);
   assert.equal(result.action, "answer");
   if (result.action === "answer") assert.equal(parsed.options[result.optionIndex]?.label, injected.options[1].label);
 });
@@ -108,7 +111,7 @@ for (const scenario of [
 ]) {
   test(`rejects ${scenario.name} rather than silently handing off`, async (t) => {
     t.mock.method(globalThis, "fetch", async () => Response.json(scenario.body));
-    await assert.rejects(judgeQuestion(goal, question, requestOptions), /invalid judgment response/i);
+    await assert.rejects(judgeQuestion({ goal, question, conversation: [] }, requestOptions), /invalid judgment response/i);
   });
 }
 
@@ -133,7 +136,7 @@ for (const scenario of [
 test("rejects empty or oversized goal before network access", async (t) => {
   const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(fixture()));
   for (const badGoal of [" ", "x".repeat(4001)]) {
-    await assert.rejects(judgeQuestion(badGoal, question, requestOptions), /goal/i);
+    await assert.rejects(judgeQuestion({ goal: badGoal, question, conversation: [] }, requestOptions), /goal/i);
   }
   assert.equal(fetchMock.mock.callCount(), 0);
 });
@@ -141,7 +144,7 @@ test("rejects empty or oversized goal before network access", async (t) => {
 test("enforces UTF-8 budget on the combined goal and question without truncating", async (t) => {
   const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(fixture()));
   const large = { ...question, context: "界".repeat(6000) };
-  await assert.rejects(judgeQuestion("界".repeat(4000), large, requestOptions), /byte.*budget|budget/i);
+  await assert.rejects(judgeQuestion({ goal: "界".repeat(4000), question: large, conversation: [] }, requestOptions), /byte.*budget|budget/i);
   assert.equal(fetchMock.mock.callCount(), 0);
 });
 
@@ -149,7 +152,7 @@ test("already-aborted questions never contact the service", async (t) => {
   const controller = new AbortController();
   controller.abort(new Error("private cancellation reason"));
   const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(fixture()));
-  await assert.rejects(judgeQuestion(goal, question, { ...requestOptions, signal: controller.signal }), { name: "AbortError" });
+  await assert.rejects(judgeQuestion({ goal, question, conversation: [] }, { ...requestOptions, signal: controller.signal }), { name: "AbortError" });
   assert.equal(fetchMock.mock.callCount(), 0);
 });
 
@@ -157,7 +160,7 @@ test("an abort discards even a late successful response", async (t) => {
   const controller = new AbortController();
   const response = Promise.withResolvers<Response>();
   t.mock.method(globalThis, "fetch", async () => response.promise);
-  const pending = judgeQuestion(goal, question, { ...requestOptions, signal: controller.signal });
+  const pending = judgeQuestion({ goal, question, conversation: [] }, { ...requestOptions, signal: controller.signal });
   controller.abort();
   response.resolve(Response.json(fixture()));
   await assert.rejects(pending, { name: "AbortError" });
@@ -168,7 +171,7 @@ test("snapshots options before asynchronous selection so callers cannot change t
   const response = Promise.withResolvers<Response>();
   t.mock.method(globalThis, "fetch", async () => response.promise);
   const snapshot = parseQuestion(mutable);
-  const pending = judgeQuestion(goal, snapshot, requestOptions);
+  const pending = judgeQuestion({ goal, question: snapshot, conversation: [] }, requestOptions);
   mutable.options[1]!.label = "Delete all data";
   mutable.options.reverse();
   response.resolve(Response.json(fixture()));
@@ -188,4 +191,12 @@ test("bounds the question alone even on direct human handoff paths", () => {
     requiresApproval: true,
   };
   assert.throws(() => parseQuestion(oversized), /byte.*budget/);
+});
+
+test("history participates in the question state byte budget before HTTP", async (t) => {
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json(fixture()));
+  await assert.rejects(judgeQuestion({
+    goal, question, conversation: [{ role: "user", text: "制".repeat(8000) }],
+  }, requestOptions), /byte.*budget/);
+  assert.equal(fetch.mock.callCount(), 0);
 });

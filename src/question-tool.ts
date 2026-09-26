@@ -1,9 +1,11 @@
 import type { AgentToolResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { ChoiceQuestionSchema, judgeQuestion, parseQuestion, type ChoiceQuestion } from "./choice.ts";
 import type { JevRequestOptions } from "./client.ts";
+import type { ConversationMessage } from "./state.ts";
 
 export interface ChoiceToolHooks {
   getGoal(): string | undefined;
+  getConversation(ctx: ExtensionContext): ConversationMessage[];
   getRequestOptions(signal: AbortSignal): JevRequestOptions;
   pause(ctx: ExtensionContext, reason: string): void;
   timeoutMs: number;
@@ -159,7 +161,8 @@ export function registerChoiceTool(pi: ExtensionAPI, hooks: ChoiceToolHooks): Ch
         if (goal !== undefined && !question.requiresApproval) {
           try {
             const requestSignal = AbortSignal.any([operation.signal, AbortSignal.timeout(hooks.timeoutMs)]);
-            const judgment = await waitFor(judgeQuestion(goal, question, hooks.getRequestOptions(requestSignal)), requestSignal);
+            const input = { goal, question, conversation: hooks.getConversation(ctx) };
+            const judgment = await waitFor(judgeQuestion(input, hooks.getRequestOptions(requestSignal)), requestSignal);
             if (!isFresh(operation)) return cancelled(question, operation, ctx);
             // 設定・質問本文・未検証の追加メタデータを永続ログへ流さない。
             pi.appendEntry("jev-choice-judgment", {

@@ -2,11 +2,15 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { judge } from "../src/jev.ts";
 import type { JudgmentState } from "../src/state.ts";
+import { isolateJevLogs } from "./log-environment.ts";
+
+isolateJevLogs();
 
 const state: JudgmentState = {
   goal: "Implement a local task list with persistent storage.",
   latestReport: "The list is implemented. Next I will run the persistence tests.",
   previousReport: null,
+  conversation: [],
   recentTools: [],
   iteration: 1,
 };
