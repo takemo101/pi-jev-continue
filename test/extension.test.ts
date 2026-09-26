@@ -94,12 +94,12 @@ function boundary(outcome: AgentBeforeSettleEvent["outcome"] = "completed"): Age
   };
 }
 
-function answer() {
+function answer(choice: "verify" | "other" = "verify") {
   return Response.json({
     model: "jev-1.13.0", usage: { input_tokens: 100, output_tokens: 20 },
     answers: {
-      next_step: { type: "choice", choice: "verify", confidence: 0.95,
-        probabilities: { implement: 0.01, fix: 0.01, verify: 0.96, improve: 0.01, other: 0.01 } },
+      next_step: { type: "choice", choice, confidence: 0.95,
+        probabilities: { implement: 0.01, fix: 0.01, verify: choice === "verify" ? 0.96 : 0.01, improve: 0.01, other: choice === "other" ? 0.96 : 0.01 } },
       needs_human: { type: "noul", noul: 0.01 }, in_scope: { type: "noul", noul: 0.99 },
     },
   });
@@ -108,6 +108,66 @@ function answer() {
 function deferred() {
   return Promise.withResolvers<Response>();
 }
+
+for (const source of ["interactive", "rpc"]) {
+  test(`a Jev stop keeps automation enabled for the next ${source} conversation`, async (t) => {
+    const h = harness(t);
+    let judgments = 0;
+    const fetch = t.mock.method(globalThis, "fetch", async () => answer(++judgments === 2 ? "other" : "verify"));
+    await h.command("jev-max", "2");
+    await h.command("jev-on", "Improve parser error handling");
+    h.emit("before_agent_start");
+    assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
+    assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+    const stoppedStatus = h.status();
+    assert.match(stoppedStatus, /on 1\/2/);
+    h.emit("agent_settled");
+    assert.equal(h.status(), stoppedStatus);
+    assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+    assert.equal(fetch.mock.callCount(), 2, "Waiting must not trigger another judgment");
+
+    h.emit("input", { source, text: "Also verify malformed parser input." });
+    assert.ok(h.emit("before_agent_start"));
+    assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
+    assert.match(h.status(), /on 2\/2/);
+    assert.equal(fetch.mock.callCount(), 3);
+    assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+    assert.match(h.status(), /off.*limit/);
+    assert.equal(fetch.mock.callCount(), 3, "A new conversation must not reset the continuation limit");
+  });
+}
+
+for (const stop of ["command", "escape", "new session"] as const) {
+  test(`${stop} still disables automation while waiting after a Jev stop`, async (t) => {
+    const h = harness(t);
+    const fetch = t.mock.method(globalThis, "fetch", async () => answer("other"));
+    await h.command("jev-on", "Improve parser error handling");
+    await h.emit("agent_before_settle", boundary());
+    h.emit("agent_settled");
+    if (stop === "command") await h.command("jev-off");
+    else if (stop === "escape") h.escape();
+    else h.emit("session_start", { reason: "new" });
+    h.emit("input", { source: "interactive", text: "Explain the parser." });
+    assert.equal(h.emit("before_agent_start"), undefined);
+    assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+    assert.equal(fetch.mock.callCount(), 1);
+    assert.match(h.status(), /off/);
+  });
+}
+
+test("a host abort in the conversation after a Jev stop still disables automation", async (t) => {
+  const h = harness(t);
+  const fetch = t.mock.method(globalThis, "fetch", async () => answer("other"));
+  await h.command("jev-on", "Improve parser error handling");
+  await h.emit("agent_before_settle", boundary());
+  h.emit("agent_settled");
+  h.emit("input", { source: "rpc", text: "Verify another case." });
+  h.emit("before_agent_start");
+  h.emit("agent_settled");
+  assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+  assert.equal(fetch.mock.callCount(), 1);
+  assert.match(h.status(), /off/);
+});
 
 test("permits the configured number of continuations then stops without another judgment", async (t) => {
   const h = harness(t);
