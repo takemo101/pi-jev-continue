@@ -4,13 +4,13 @@ import { parseChoice, parseEnvelope, parseNoul, requestJev, type JevRequestOptio
 import { INPUT_LIMITS, type ConversationMessage } from "./state.ts";
 
 export const ChoiceQuestionSchema = Type.Object({
-  question: Type.String({ minLength: 1, maxLength: 2000, pattern: "\\S" }),
-  context: Type.String({ maxLength: 6000 }),
+  question: Type.String({ minLength: 1, maxLength: 2000, pattern: "\\S", description: "One concrete decision to resolve, written in the user's language." }),
+  context: Type.String({ maxLength: 6000, description: "Concise facts and constraints needed for this decision, in the user's language. Do not repeat the question or invent authorization." }),
   options: Type.Array(Type.Object({
-    label: Type.String({ minLength: 1, maxLength: 160, pattern: "\\S" }),
-    description: Type.String({ minLength: 1, maxLength: 1600, pattern: "\\S" }),
+    label: Type.String({ minLength: 1, maxLength: 160, pattern: "\\S", description: "A short, distinct option label in the user's language." }),
+    description: Type.String({ minLength: 1, maxLength: 1600, pattern: "\\S", description: "Meaningful consequences, constraints, and tradeoffs for this option, in the user's language; do not merely repeat its label." }),
   }, { additionalProperties: false }), { minItems: 2, maxItems: 8 }),
-  requiresApproval: Type.Boolean(),
+  requiresApproval: Type.Boolean({ description: "True when this question asks for human approval or authorization. Never treat an automatic choice as permission." }),
 }, { additionalProperties: false });
 
 export type ChoiceQuestion = Static<typeof ChoiceQuestionSchema>;

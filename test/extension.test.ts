@@ -5,12 +5,13 @@ import type { AgentBeforeSettleEvent, AgentBeforeSettleEventResult, ExtensionAPI
 import jevContinue from "../src/index.ts";
 import { isolateJevLogs } from "./log-environment.ts";
 import type { ConversationMessage } from "../src/state.ts";
+import type { HumanAnswer } from "../src/human-question.ts";
 
 isolateJevLogs();
 
 type Handler = (event: unknown, ctx: ExtensionCommandContext) => unknown;
 
-function harness(t: TestContext, flags: Record<string, string> = {}) {
+function harness(t: TestContext, flags: Record<string, string> = {}, mode: ExtensionCommandContext["mode"] = "rpc") {
   const oldKey = process.env.TYPESAFE_API_KEY;
   process.env.TYPESAFE_API_KEY = "test-only-key";
   t.after(() => {
@@ -28,11 +29,15 @@ function harness(t: TestContext, flags: Record<string, string> = {}) {
   let aborts = 0;
   let sessionMessages: AgentMessage[] = [];
   let select: (options: string[]) => Promise<string | undefined> = async () => undefined;
+  let input: () => Promise<string | undefined> = async () => undefined;
+  let custom: (() => Promise<HumanAnswer | undefined>) | undefined;
+  const noteOpened = Promise.withResolvers<void>();
+  const customOpened = Promise.withResolvers<void>();
   const dialogOpened = Promise.withResolvers<string[]>();
   // The harness supplies only the context capabilities exercised by this extension.
   const ctx = {
     hasUI: true,
-    mode: "tui",
+    mode,
     signal: undefined,
     isIdle: () => true,
     abort() { aborts += 1; },
@@ -44,6 +49,15 @@ function harness(t: TestContext, flags: Record<string, string> = {}) {
       select(_title: string, options: string[]) {
         dialogOpened.resolve(options);
         return select(options);
+      },
+      input() {
+        noteOpened.resolve();
+        return input();
+      },
+      custom() {
+        if (!custom) throw new Error("This test must explicitly configure its custom TUI dialog.");
+        customOpened.resolve();
+        return custom();
       },
       onTerminalInput(handler: (data: string) => unknown) {
         terminal = handler;
@@ -71,8 +85,10 @@ function harness(t: TestContext, flags: Record<string, string> = {}) {
   emit("session_start", { reason: "startup" });
   t.after(() => { emit("session_shutdown"); });
   return {
-    ctx, sent, entries, emit, command, dialogOpened,
+    ctx, sent, entries, emit, command, dialogOpened, noteOpened, customOpened,
     setSelect(handler: (options: string[]) => Promise<string | undefined>) { select = handler; },
+    setInput(handler: () => Promise<string | undefined>) { input = handler; },
+    setCustom(handler: () => Promise<HumanAnswer | undefined>) { custom = handler; },
     async choose(params: unknown) {
       const tool = tools.get("jev_choose");
       assert.ok(tool, "The question must be handled by the autonomous-choice tool");
@@ -146,7 +162,7 @@ for (const source of ["interactive", "rpc"]) {
 
 for (const stop of ["command", "escape", "new session"] as const) {
   test(`${stop} still disables automation while waiting after a Jev stop`, async (t) => {
-    const h = harness(t);
+    const h = harness(t, {}, "tui");
     const fetch = t.mock.method(globalThis, "fetch", async () => answer("other"));
     await h.command("jev-on", "Improve parser error handling");
     await h.emit("agent_before_settle", boundary());
@@ -207,7 +223,7 @@ test("manual stop cancels an in-flight judgment and late results cannot restart 
 });
 
 test("Escape cancels Jev even while the provider turn is already complete", async (t) => {
-  const h = harness(t);
+  const h = harness(t, {}, "tui");
   const waiting = deferred();
   t.mock.method(globalThis, "fetch", () => waiting.promise);
   await h.command("jev-on", "Improve parser error handling");
@@ -219,7 +235,7 @@ test("Escape cancels Jev even while the provider turn is already complete", asyn
 });
 
 test("a new session invalidates old judgments without rearming the startup goal", async (t) => {
-  const h = harness(t, { "jev-goal": "Improve parser error handling" });
+  const h = harness(t, { "jev-goal": "Improve parser error handling" }, "tui");
   const waiting = deferred();
   t.mock.method(globalThis, "fetch", () => waiting.promise);
   h.emit("before_agent_start");
@@ -314,7 +330,7 @@ test("an explicit command goal takes precedence over an unused startup goal", as
 });
 
 test("Kitty-encoded Escape stops the loop while arrow keys do not", async (t) => {
-  const h = harness(t);
+  const h = harness(t, {}, "tui");
   const fetch = t.mock.method(globalThis, "fetch", async () => answer());
   await h.command("jev-on", "Improve parser error handling");
   h.escape("\u001b[A");
@@ -401,17 +417,22 @@ for (const handoff of ["approval", "judgment", "HTTP error"] as const) {
 
 for (const stop of ["command", "escape", "session switch"] as const) {
   test(`${stop} during a human question prevents a late answer from re-enabling Jev`, async (t) => {
-    const h = harness(t);
+    const h = harness(t, {}, stop === "escape" ? "tui" : "rpc");
     const selection = Promise.withResolvers<string | undefined>();
+    const customAnswer = Promise.withResolvers<HumanAnswer | undefined>();
     h.setSelect(() => selection.promise);
+    h.setCustom(() => customAnswer.promise);
     const fetch = t.mock.method(globalThis, "fetch", async () => answer());
     await h.command("jev-on", "Build an offline CLI");
     const pending = h.choose({ ...implementationQuestion, requiresApproval: true });
-    const choices = await h.dialogOpened.promise;
+    const choices = stop === "escape"
+      ? (await h.customOpened.promise, [])
+      : await h.dialogOpened.promise;
     if (stop === "command") await h.command("jev-off");
     else if (stop === "escape") h.escape();
     else h.emit("session_before_switch");
     selection.resolve(choices[1]);
+    customAnswer.resolve({ optionIndex: 1 });
     const result = await pending;
     assert.equal(result.terminate, true);
     h.emit("agent_settled");
@@ -565,3 +586,51 @@ test("question history is rebuilt for a new session rather than reusing previous
   await h.choose(implementationQuestion);
   assert.deepEqual(captured, [[], [{ role: "user", text: "New session constraint" }]]);
 });
+
+for (const enabled of [false, true]) {
+  test(`saving a note leaves tools gated and preserves enabled=${enabled} until selection`, async (t) => {
+    const h = harness(t);
+    if (enabled) await h.command("jev-on", "Build an offline CLI");
+    let selections = 0;
+    const redrawn = Promise.withResolvers<string[]>();
+    const selection = Promise.withResolvers<string | undefined>();
+    h.setSelect((choices) => {
+      if (++selections === 1) return Promise.resolve(choices.at(-1));
+      redrawn.resolve(choices);
+      return selection.promise;
+    });
+    h.setInput(async () => "Keep data local.");
+    const fetch = t.mock.method(globalThis, "fetch", async () => answer());
+    const pending = h.choose({ ...implementationQuestion, requiresApproval: true });
+    const choices = await redrawn.promise;
+    const blocked = h.emit("tool_call", { toolName: "write" });
+    assert.ok(blocked && typeof blocked === "object" && "block" in blocked && blocked.block === true);
+    assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+    selection.resolve(choices[1]);
+    const result = await pending;
+    assert.ok(result.details && typeof result.details === "object" && "notes" in result.details);
+    assert.equal(result.details.notes, "Keep data local.");
+    assert.equal(h.emit("tool_call", { toolName: "write" }), undefined);
+    assert.match(h.status(), enabled ? /on/ : /off/);
+    assert.equal(fetch.mock.callCount(), 0);
+  });
+}
+
+for (const stop of ["command", "session switch"] as const) {
+  test(`${stop} during note input rejects late text and keeps automation disabled`, async (t) => {
+    const h = harness(t);
+    const note = Promise.withResolvers<string | undefined>();
+    h.setSelect(async (choices) => choices.at(-1));
+    h.setInput(() => note.promise);
+    await h.command("jev-on", "Build an offline CLI");
+    const pending = h.choose({ ...implementationQuestion, requiresApproval: true });
+    await h.noteOpened.promise;
+    if (stop === "command") await h.command("jev-off");
+    else h.emit("session_before_switch");
+    const result = await pending;
+    note.resolve("Do not accept this stale note");
+    assert.equal(result.terminate, true);
+    assert.match(h.status(), /off/);
+    assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+  });
+}
