@@ -3,6 +3,10 @@ import test, { type TestContext } from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AgentBeforeSettleEvent, AgentBeforeSettleEventResult, ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import jevContinue from "../src/index.ts";
+import { isolateJevLogs } from "./log-environment.ts";
+import type { ConversationMessage } from "../src/state.ts";
+
+isolateJevLogs();
 
 type Handler = (event: unknown, ctx: ExtensionCommandContext) => unknown;
 
@@ -22,6 +26,7 @@ function harness(t: TestContext, flags: Record<string, string> = {}) {
   let status = "";
   let terminal: ((data: string) => unknown) | undefined;
   let aborts = 0;
+  let sessionMessages: AgentMessage[] = [];
   // The harness supplies only the context capabilities exercised by this extension.
   const ctx = {
     hasUI: true,
@@ -30,6 +35,7 @@ function harness(t: TestContext, flags: Record<string, string> = {}) {
     isIdle: () => true,
     abort() { aborts += 1; },
     hasPendingMessages: () => pending,
+    sessionManager: { buildSessionProjection: () => ({ messages: sessionMessages }) },
     ui: {
       notify() {},
       setStatus(_key: string, text: string) { status = text; },
@@ -67,6 +73,7 @@ function harness(t: TestContext, flags: Record<string, string> = {}) {
     },
     aborts: () => aborts,
     setPending(value: boolean) { pending = value; },
+    setMessages(messages: AgentMessage[]) { sessionMessages = messages; },
     escape(data = "\u001b") { terminal?.(data); },
     status: () => status,
   };
@@ -339,3 +346,58 @@ for (const [name, args] of [
     assert.equal(h.emit("tool_call", { toolName: "read", input: { path: "README.md" } }), undefined);
   });
 }
+
+test("history configuration limits both judgments and zero disables conversation input", async (t) => {
+  const h = harness(t, { "jev-history": "2" });
+  const history: AgentMessage[] = [
+    { role: "user", content: "Older limit", timestamp: 0 },
+    ...boundary().context.contextMessages,
+    { role: "user", content: "Do not use SQLite", timestamp: 1 },
+  ];
+  const captured: ConversationMessage[][] = [];
+  t.mock.method(globalThis, "fetch", async (_input: unknown, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body));
+    captured.push(body.state.conversation);
+    return body.questions.selection ? questionAnswer() : answer();
+  });
+  h.setMessages(history);
+  await h.command("jev-on", "Build an offline CLI");
+  await h.choose(implementationQuestion);
+  const event = boundary();
+  event.context.contextMessages = [...history, ...event.context.contextMessages];
+  await h.emit("agent_before_settle", event);
+  for (const conversation of captured) {
+    assert.equal(conversation.length, 2);
+    assert.equal(conversation[0].role, "assistant");
+    assert.deepEqual(conversation[1], { role: "user", text: "Do not use SQLite" });
+  }
+  assert.equal(captured.length, 2);
+  await h.command("jev-history", "0");
+  await h.command("jev-history", "-1");
+  await h.choose(implementationQuestion);
+  await h.emit("agent_before_settle", event);
+  assert.deepEqual(captured.slice(2), [[], []]);
+});
+
+test("invalid startup history count does not activate the CLI goal", (t) => {
+  const h = harness(t, { "jev-goal": "Build an offline CLI", "jev-history": "1.5" });
+  assert.equal(h.emit("before_agent_start"), undefined);
+  assert.match(h.status(), /off/);
+});
+
+test("question history is rebuilt for a new session rather than reusing previous messages", async (t) => {
+  const h = harness(t, { "jev-history": "0" });
+  const captured: ConversationMessage[][] = [];
+  t.mock.method(globalThis, "fetch", async (_input: unknown, init?: RequestInit) => {
+    captured.push(JSON.parse(String(init?.body)).state.conversation);
+    return questionAnswer();
+  });
+  h.setMessages([{ role: "user", content: "Old session constraint", timestamp: 0 }]);
+  await h.command("jev-on", "Build an offline CLI");
+  await h.choose(implementationQuestion);
+  h.emit("session_start", { reason: "new" });
+  h.setMessages([{ role: "user", content: "New session constraint", timestamp: 1 }]);
+  await h.command("jev-on", "Build an offline CLI");
+  await h.choose(implementationQuestion);
+  assert.deepEqual(captured, [[], [{ role: "user", text: "New session constraint" }]]);
+});

@@ -4,6 +4,9 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { AgentToolResult, ExtensionAPI, ExtensionContext, ExtensionUIDialogOptions, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { ChoiceQuestion, ChoiceQuestionSchema } from "../src/choice.ts";
 import { registerChoiceTool, type ChoiceToolDetails } from "../src/question-tool.ts";
+import { isolateJevLogs } from "./log-environment.ts";
+
+isolateJevLogs();
 
 type ChoiceTool = ToolDefinition<typeof ChoiceQuestionSchema, ChoiceToolDetails, unknown>;
 interface Dialog {
@@ -73,6 +76,7 @@ function harness(t: TestContext, options: HarnessOptions = {}) {
   } as unknown as ExtensionContext;
   const controller = registerChoiceTool(pi, {
     getGoal: () => goal,
+    getConversation: () => [],
     getRequestOptions: (signal) => ({ apiKey: "test-only-secret", model: "jev-1.13.0", signal }),
     pause(_ctx, reason) {
       goal = undefined;

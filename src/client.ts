@@ -1,3 +1,5 @@
+import { createJevRequestLog } from "./request-log.ts";
+
 export interface JevRequestOptions {
   apiKey: string;
   model: string;
@@ -75,30 +77,44 @@ export async function requestJev(
 ): Promise<unknown> {
   const { apiKey, model, signal } = options;
   ensureActive(signal);
+  const bodyText = JSON.stringify({ state, model, questions });
+  const url = "https://api.typesafe.ai/v1/systemone";
+  const log = createJevRequestLog(apiKey);
+  const started = performance.now();
+  const durationMs = () => Math.round((performance.now() - started) * 1000) / 1000;
+  log.append({ event: "request", url, method: "POST", model, body: bodyText });
   let response: Response;
   try {
-    response = await fetch("https://api.typesafe.ai/v1/systemone", {
+    response = await fetch(url, {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ state, model, questions }),
+      body: bodyText,
       signal,
       // 固定 API 以外へ認証ヘッダーを転送しない。
       redirect: "error",
     });
   } catch {
-    // エラー本文や低レベル例外には機密情報が含まれ得るため、呼出し元へ転送しない。
+    log.append({ event: "error", kind: signal.aborted ? "cancelled" : "network", durationMs: durationMs() });
     ensureActive(signal);
     throw new Error("Jev request failed before receiving a response.");
   }
+  let text: string;
+  try {
+    text = await response.text();
+  } catch {
+    log.append({ event: "response", status: response.status, durationMs: durationMs(), body: null, aborted: signal.aborted });
+    log.append({ event: "error", kind: signal.aborted ? "cancelled" : "response_body", status: response.status, durationMs: durationMs() });
+    ensureActive(signal);
+    throw new Error("Jev response body could not be read.");
+  }
+  // 中断後の遅い応答や不正 JSON、HTTP エラーも、判断に採用する前に記録する。
+  log.append({ event: "response", status: response.status, durationMs: durationMs(), body: text, aborted: signal.aborted });
   ensureActive(signal);
   if (!response.ok) throw new Error(`Jev request failed (HTTP ${response.status}).`);
-  let body: unknown;
   try {
-    body = await response.json();
+    return JSON.parse(text);
   } catch {
-    ensureActive(signal);
+    log.append({ event: "error", kind: "invalid_json", status: response.status, durationMs: durationMs() });
     invalidResponse();
   }
-  ensureActive(signal);
-  return body;
 }
