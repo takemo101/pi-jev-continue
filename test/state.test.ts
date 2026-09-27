@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { buildState } from "../src/state.ts";
+import { buildState, INPUT_LIMITS } from "../src/state.ts";
+import { EMPTY_POLICY, type ContinuationPolicy } from "../src/policy.ts";
 
 type Assistant = Extract<AgentMessage, { role: "assistant" }>;
 type ToolResult = Extract<AgentMessage, { role: "toolResult" }>;
@@ -82,6 +83,7 @@ test("extracts report text and tool text without thinking, arguments, images, or
     conversation: [{ role: "user", text: "Implement the requested feature" }],
     recentTools: [{ name: "read", isError: false, output: "Textual evidence", truncated: false }],
     iteration: 3,
+    policy: EMPTY_POLICY,
   });
 });
 
@@ -139,6 +141,18 @@ test("excludes tool results from before the newest user message even when fewer 
 test("rejects an oversized combined state including multibyte text", () => {
   assert.throws(() => buildState("Goal", [assistant("日".repeat(9000))], null, 1));
   assert.throws(() => buildState("Goal", [assistant("x".repeat(12000))], "y".repeat(12000), 2));
+});
+
+test("counts complete UTF-8 policy text at the combined state budget boundary", () => {
+  const policy: ContinuationPolicy = [{ scope: "project", path: "/project/.pi/CONTINUE.md", text: "界".repeat(2000) }];
+  const messages = [assistant("Next I will verify the result.")];
+  const base = buildState("Goal", messages, "", 1, 0, policy);
+  const previousReport = "r".repeat(INPUT_LIMITS.stateBytes - Buffer.byteLength(JSON.stringify(base), "utf8"));
+  const state = buildState("Goal", messages, previousReport, 1, 0, policy);
+  assert.equal(Buffer.byteLength(JSON.stringify(state), "utf8"), INPUT_LIMITS.stateBytes);
+  assert.throws(() => buildState("Goal", messages, previousReport, 1, 0, [
+    { ...policy[0]!, text: `${policy[0]!.text}界` },
+  ]), /byte.*budget/);
 });
 
 test("includes the last ten public conversation messages before the current report", () => {

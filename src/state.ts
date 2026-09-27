@@ -1,4 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { EMPTY_POLICY, type ContinuationPolicy } from "./policy.ts";
 
 export const DEFAULT_HISTORY_COUNT = 10;
 
@@ -48,6 +49,7 @@ export interface JudgmentState {
     truncated: boolean;
   }>;
   iteration: number;
+  policy: ContinuationPolicy;
 }
 
 /**
@@ -60,6 +62,7 @@ export function buildState(
   previousReport: string | null,
   iteration: number,
   historyCount = DEFAULT_HISTORY_COUNT,
+  policy: ContinuationPolicy = EMPTY_POLICY,
 ): JudgmentState {
   if (!goal.trim() || goal.length > INPUT_LIMITS.goalCharacters) {
     throw new Error(`Goal must contain text and be at most ${INPUT_LIMITS.goalCharacters} characters.`);
@@ -96,7 +99,7 @@ export function buildState(
 
   // 判定対象の最新報告は別フィールドにあるため、履歴にはそれより前の発言を入れる。
   const conversation = extractConversation(messages, historyCount, reportIndex);
-  const state = { goal, latestReport, previousReport, conversation, recentTools, iteration };
+  const state = { goal, latestReport, previousReport, conversation, recentTools, iteration, policy };
   // CJK を含む入力でも、質問文を加える余地を残す。判断材料を黙って削らず停止する。
   if (Buffer.byteLength(JSON.stringify(state), "utf8") > INPUT_LIMITS.stateBytes) {
     throw new Error(`Judgment state exceeds the ${INPUT_LIMITS.stateBytes}-byte input budget; reduce the history count or shorten the goal or iteration report.`);

@@ -88,6 +88,7 @@ function harness(t: TestContext, options: HarnessOptions = {}) {
   } as unknown as ExtensionContext;
   const controller = registerChoiceTool(pi, {
     getGoal: () => goal,
+    getPolicy: () => [],
     getConversation: () => [],
     getRequestOptions: (signal) => ({ apiKey: "test-only-secret", model: "jev-1.13.0", signal }),
     waitForHuman(_ctx, reason) {

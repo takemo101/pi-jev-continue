@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AgentBeforeSettleEvent, AgentBeforeSettleEventResult, ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import jevContinue from "../src/index.ts";
@@ -13,16 +16,27 @@ type Handler = (event: unknown, ctx: ExtensionCommandContext) => unknown;
 
 function harness(t: TestContext, flags: Record<string, string> = {}, mode: ExtensionCommandContext["mode"] = "rpc") {
   const oldKey = process.env.TYPESAFE_API_KEY;
+  const oldHome = process.env.HOME;
+  const root = mkdtempSync(join(tmpdir(), "jev-extension-"));
+  const home = join(root, "home");
+  const cwd = join(root, "project");
+  mkdirSync(join(home, ".pi"), { recursive: true });
+  mkdirSync(join(cwd, ".pi"), { recursive: true });
+  process.env.HOME = home;
   process.env.TYPESAFE_API_KEY = "test-only-key";
   t.after(() => {
     if (oldKey === undefined) delete process.env.TYPESAFE_API_KEY;
     else process.env.TYPESAFE_API_KEY = oldKey;
+    if (oldHome === undefined) delete process.env.HOME;
+    else process.env.HOME = oldHome;
+    rmSync(root, { recursive: true, force: true });
   });
   const handlers = new Map<string, Handler>();
   const commands = new Map<string, { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }>();
   const tools = new Map<string, ToolDefinition>();
   const sent: string[] = [];
   const entries: { type: string; data: unknown }[] = [];
+  const notifications: string[] = [];
   let pending = false;
   let status = "";
   let terminal: ((data: string) => unknown) | undefined;
@@ -36,6 +50,7 @@ function harness(t: TestContext, flags: Record<string, string> = {}, mode: Exten
   const dialogOpened = Promise.withResolvers<string[]>();
   // The harness supplies only the context capabilities exercised by this extension.
   const ctx = {
+    cwd,
     hasUI: true,
     mode,
     signal: undefined,
@@ -44,7 +59,7 @@ function harness(t: TestContext, flags: Record<string, string> = {}, mode: Exten
     hasPendingMessages: () => pending,
     sessionManager: { buildSessionProjection: () => ({ messages: sessionMessages }) },
     ui: {
-      notify() {},
+      notify(message: string) { notifications.push(message); },
       setStatus(_key: string, text: string) { status = text; },
       select(_title: string, options: string[]) {
         dialogOpened.resolve(options);
@@ -85,7 +100,7 @@ function harness(t: TestContext, flags: Record<string, string> = {}, mode: Exten
   emit("session_start", { reason: "startup" });
   t.after(() => { emit("session_shutdown"); });
   return {
-    pi, ctx, sent, entries, emit, command, dialogOpened, noteOpened, customOpened,
+    pi, ctx, home, sent, entries, notifications, emit, command, dialogOpened, noteOpened, customOpened,
     setSelect(handler: (options: string[]) => Promise<string | undefined>) { select = handler; },
     setInput(handler: () => Promise<string | undefined>) { input = handler; },
     setCustom(handler: () => Promise<HumanAnswer | undefined>) { custom = handler; },
@@ -702,6 +717,43 @@ test("failure to start a goal leaves it enabled but idle until the next user inp
   assert.equal(fetch.mock.callCount(), 0);
   send.mock.restore();
   h.emit("input", { source: "rpc", text: "Start now." });
+  assert.ok(h.emit("before_agent_start"));
+  assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
+});
+
+for (const activation of ["command", "cli"] as const) {
+  test(`${activation} policy load failure does not start automation`, async (t) => {
+    const h = harness(t, activation === "cli" ? { "jev-goal": "Verify parser behavior" } : {});
+    mkdirSync(join(h.ctx.cwd, ".pi", "CONTINUE.md"));
+    const fetch = t.mock.method(globalThis, "fetch", async () => answer());
+    if (activation === "command") await h.command("jev-on", "Verify parser behavior");
+    assert.equal(h.emit("before_agent_start"), undefined);
+    assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+    assert.equal(h.sent.length, 0);
+    assert.equal(fetch.mock.callCount(), 0);
+    assert.match(h.status(), /^Jev off\b/);
+    assert.ok(h.notifications.some(message => message.includes(join(h.ctx.cwd, ".pi", "CONTINUE.md"))));
+  });
+}
+
+test("policy files stay frozen during a run and are reloaded only on explicit activation", async (t) => {
+  const h = harness(t);
+  const path = join(h.ctx.cwd, ".pi", "CONTINUE.md");
+  writeFileSync(path, "Continue local parser verification.");
+  const fetch = t.mock.method(globalThis, "fetch", async () => answer());
+  await h.command("jev-on", "Verify parser behavior");
+  rmSync(path);
+  mkdirSync(path);
+  assert.ok(h.emit("before_agent_start"));
+  assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
+  await h.command("jev-on", "A different goal");
+  assert.equal(h.sent.length, 1, "Failed reactivation must not launch a different goal");
+  assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+  assert.equal(fetch.mock.callCount(), 1, "Failed reactivation must wait for input, not use a partial policy");
+  rmSync(path, { recursive: true });
+  writeFileSync(path, "Stop after the required checks.");
+  await h.command("jev-on", "Verify parser behavior");
+  assert.equal(h.sent.length, 2);
   assert.ok(h.emit("before_agent_start"));
   assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
 });
