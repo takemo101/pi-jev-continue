@@ -1,4 +1,4 @@
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
   CURSOR_MARKER,
   Editor,
@@ -42,6 +42,7 @@ export async function showHumanQuestionTui(
         label: displayText(option.label),
         description: displayText(option.description),
       }));
+      const border = new DynamicBorder((text) => theme.fg("accent", text));
       const editor = new Editor(tui, {
         borderColor: (text) => theme.fg("accent", text),
         selectList: {
@@ -127,8 +128,8 @@ export async function showHumanQuestionTui(
 
       function render(width: number): string[] {
         const columns = Math.max(1, width);
-        // The inline custom view shares the terminal with pi's path, model, and status footer.
-        const height = Math.max(4, tui.terminal.rows - 5);
+        // Reserve pi's path/model/status footer and the two fixed dialog borders.
+        const height = Math.max(4, tui.terminal.rows - 7);
         const wrap = (text: string) => wrapTextWithAnsi(text, columns);
         const keys = (binding: Keybinding) => keybindings.getKeys(binding).join("/");
         const hints = editing
@@ -143,6 +144,17 @@ export async function showHumanQuestionTui(
           ? `Optional note (${editor.getExpandedText().trim().length}/${prompt.notesLimit})`
           : `Selected: ${selected === options.length ? "Add/edit note (optional; not an answer)" : `${selected + 1}. ${options[selected]!.label}`}${notes ? " · Note attached" : ""}`;
         footer.unshift(theme.fg("accent", truncateToWidth(status.replace(/\n/g, " "), columns)));
+        const footerRows = footer.length;
+        const frame = (content: string[]) => {
+          const split = Math.max(0, content.length - footerRows);
+          const borderLines = border.render(columns);
+          return [
+            ...borderLines,
+            ...content.slice(0, split),
+            ...borderLines,
+            ...content.slice(split),
+          ];
+        };
 
         if (editing) {
           if (error) {
@@ -158,7 +170,7 @@ export async function showHumanQuestionTui(
           footer.unshift(...editorLines);
         }
         if (footer.length >= height - 1) {
-          return footer.slice(-height).map((line) => truncateToWidth(line, columns));
+          return frame(footer.slice(-height).map((line) => truncateToWidth(line, columns)));
         }
 
         const lines: string[] = [];
@@ -192,11 +204,11 @@ export async function showHumanQuestionTui(
         }
         scroll = Math.min(Math.max(0, scroll), Math.max(0, lines.length - pageSize));
         const scrollHint = `${scroll + 1}-${Math.min(lines.length, scroll + pageSize)}/${lines.length} · ${keys("tui.select.pageUp")}/${keys("tui.select.pageDown")} scroll`;
-        return [
+        return frame([
           ...lines.slice(scroll, scroll + pageSize),
           theme.fg("dim", truncateToWidth(scrollHint, columns)),
           ...footer,
-        ].map((line) => truncateToWidth(line, columns));
+        ].map((line) => truncateToWidth(line, columns)));
       }
 
       return {
