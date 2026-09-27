@@ -42,6 +42,10 @@ export async function showHumanQuestionTui(
         label: displayText(option.label),
         description: displayText(option.description),
       }));
+      const noteOption = {
+        label: "Add/edit note (optional; not an answer)",
+        description: "Select to add or edit a note, then choose an answer above.",
+      };
       const border = new DynamicBorder((text) => theme.fg("accent", text));
       const editor = new Editor(tui, {
         borderColor: (text) => theme.fg("accent", text),
@@ -127,9 +131,14 @@ export async function showHumanQuestionTui(
       }
 
       function render(width: number): string[] {
-        const columns = Math.max(1, width);
-        // Reserve pi's path/model/status footer and the two fixed dialog borders.
-        const height = Math.max(4, tui.terminal.rows - 7);
+        const outerColumns = Math.max(1, width);
+        const paddingX = Math.min(1, Math.floor((outerColumns - 1) / 2));
+        const margin = " ".repeat(paddingX);
+        const columns = outerColumns - paddingX * 2;
+        // Keep at least five content rows before reserving three blank spacing rows.
+        const availableHeight = Math.max(4, tui.terminal.rows - 5);
+        const gap = availableHeight >= 10 ? [""] : [];
+        const height = availableHeight - 2 - gap.length * 3;
         const wrap = (text: string) => wrapTextWithAnsi(text, columns);
         const keys = (binding: Keybinding) => keybindings.getKeys(binding).join("/");
         const hints = editing
@@ -147,12 +156,16 @@ export async function showHumanQuestionTui(
         const footerRows = footer.length;
         const frame = (content: string[]) => {
           const split = Math.max(0, content.length - footerRows);
-          const borderLines = border.render(columns);
+          const borderLines = border.render(outerColumns);
+          const padded = content.map((line) => `${margin}${line}${margin}`);
           return [
             ...borderLines,
-            ...content.slice(0, split),
+            ...gap,
+            ...padded.slice(0, split),
+            ...gap,
             ...borderLines,
-            ...content.slice(split),
+            ...gap,
+            ...padded.slice(split),
           ];
         };
 
@@ -184,18 +197,30 @@ export async function showHumanQuestionTui(
         section("Context", context || theme.fg("dim", "No additional context."));
         section("Why your input is needed", reason);
         add(theme.fg("accent", theme.bold("Options")));
+        const addOption = (prefix: string, option: typeof options[number], active: boolean) => {
+          const optionWidth = Math.max(1, columns - prefix.length);
+          const indent = " ".repeat(prefix.length);
+          for (const [index, line] of wrapTextWithAnsi(option.label, optionWidth).entries()) {
+            lines.push(theme.fg(active ? "accent" : "text", `${index === 0 ? prefix : indent}${line}`));
+          }
+          for (const line of wrapTextWithAnsi(option.description, optionWidth)) {
+            lines.push(theme.fg("muted", `${indent}${line}`));
+          }
+        };
         const optionLines: number[] = [];
         for (const [index, option] of options.entries()) {
           optionLines.push(lines.length);
-          add(theme.fg(index === selected ? "accent" : "text", `${index === selected ? ">" : " "} ${index + 1}. ${option.label}`));
-          add(theme.fg("muted", option.description));
+          addOption(`${index === selected ? ">" : " "} ${index + 1}. `, option, index === selected);
           lines.push("");
         }
         const noteLine = lines.length;
         optionLines.push(noteLine);
-        add(theme.fg(selected === options.length ? "accent" : "text", `${selected === options.length ? ">" : " "} Add/edit note (optional; not an answer)`));
-        add(theme.fg("muted", "Select to add or edit a note, then choose an answer above."));
-        if (notes) add(displayText(notes));
+        addOption(`${selected === options.length ? ">" : " "} `, noteOption, selected === options.length);
+        if (notes) {
+          for (const line of wrapTextWithAnsi(displayText(notes), Math.max(1, columns - 2))) {
+            lines.push(`  ${line}`);
+          }
+        }
         pageSize = Math.max(1, height - footer.length - 1);
         if (reveal) {
           const target = reveal === "note" ? noteLine : optionLines[selected]!;
