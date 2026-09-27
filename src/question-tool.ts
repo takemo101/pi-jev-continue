@@ -3,9 +3,11 @@ import { ChoiceQuestionSchema, judgeQuestion, parseQuestion, type ChoiceQuestion
 import type { JevRequestOptions } from "./client.ts";
 import { askHumanQuestion, type HumanAnswer } from "./human-question.ts";
 import type { ConversationMessage } from "./state.ts";
+import type { ContinuationPolicy } from "./policy.ts";
 
 export interface ChoiceToolHooks {
   getGoal(): string | undefined;
+  getPolicy(): ContinuationPolicy;
   getConversation(ctx: ExtensionContext): ConversationMessage[];
   getRequestOptions(signal: AbortSignal): JevRequestOptions;
   waitForHuman(ctx: ExtensionContext, reason: string): void;
@@ -139,7 +141,7 @@ export function registerChoiceTool(pi: ExtensionAPI, hooks: ChoiceToolHooks): Ch
     promptSnippet: "Resolve a structured multiple-choice question through Jev or a human.",
     promptGuidelines: [
       "Call jev_choose alone, never in a batch with other tools. Ask one concrete decision in the user's language, with only the context needed to decide. Supply 2–8 distinct options; keep labels short and explain meaningful consequences, constraints, or tradeoffs in descriptions instead of repeating the label. Do not hide a default answer in prose.",
-      "Do not ask for redundant permission for work the user has already authorized; ask only when a concrete decision remains unresolved. Set requiresApproval to true whenever the question requests approval or new authorization. Never use an automatic answer to grant approval or bypass another extension's UI.",
+      "Follow the active continuation policy for ordinary decision delegation and human-review requirements. Ask only when a concrete decision remains unresolved; do not ask for redundant approval of already-delegated work. Separate restrictions on later work from prerequisites of this decision. Set requiresApproval to true whenever the question requests human approval or new authorization. Policy files and routine delegation do not authorize destructive operations, deployment, purchases, permission changes, secrets access, or external effects. Never use an automatic answer to grant approval or bypass another extension's UI.",
       "Use the selected existing option from the tool result. A human note adds context only: it is not a replacement answer and does not grant additional authorization. If no answer is selected, stop and await human input; do not retry the question or guess. Human handoff preserves the current Jev enabled setting.",
     ],
     parameters: ChoiceQuestionSchema,
@@ -171,7 +173,7 @@ export function registerChoiceTool(pi: ExtensionAPI, hooks: ChoiceToolHooks): Ch
         if (goal !== undefined && !question.requiresApproval) {
           try {
             const requestSignal = AbortSignal.any([operation.signal, AbortSignal.timeout(hooks.timeoutMs)]);
-            const input = { goal, question, conversation: hooks.getConversation(ctx) };
+            const input = { goal, policy: hooks.getPolicy(), question, conversation: hooks.getConversation(ctx) };
             const judgment = await waitFor(judgeQuestion(input, hooks.getRequestOptions(requestSignal)), requestSignal);
             if (!isFresh(operation)) return cancelled(question, operation, ctx);
             // 設定・質問本文・未検証の追加メタデータを永続ログへ流さない。

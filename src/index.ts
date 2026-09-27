@@ -6,24 +6,26 @@ import { judge } from "./jev.ts";
 import { buildState, DEFAULT_HISTORY_COUNT, extractConversation, INPUT_LIMITS } from "./state.ts";
 import { registerChoiceTool } from "./question-tool.ts";
 import { getJevLogPath } from "./request-log.ts";
+import { EMPTY_POLICY, loadContinuationPolicy, POLICY_INSTRUCTIONS, type ContinuationPolicy } from "./policy.ts";
 
 const DEFAULT_MODEL = "jev-1.13.0";
 const JUDGMENT_TIMEOUT_MS = 30_000;
 
 const REPORT_INSTRUCTIONS = `Work in bounded iterations toward the goal below. After each iteration, report concisely:
 - What changed and what execution evidence you observed.
-- Any blocker requiring human input, credentials, or approval.
-- One concrete next action within the goal, including a useful improvement if the original implementation is complete.
+- One concrete next action for the next iteration within the goal. State the immediate action separately from later planned stages, so a policy stopping point can be evaluated before crossing it. Do not bundle all remaining stages into a single next action.
+- Human input, credentials, or approval REQUIRED FOR THAT NEXT ACTION, or explicitly none. List restrictions on later work separately; do not describe them as blocking the next action unless it actually depends on them.
 Do not invent work outside the goal or claim unobserved verification. If no worthwhile in-scope action remains, say so.
-Do not ask routine permission to continue. For an unresolved multiple-choice implementation question, call jev_choose with the question, relevant context, and concrete options instead of asking in prose or using another question tool.
+Use the supplied continuation policy to decide when to continue, stop, or seek human input. By default, honor delegated routine decisions without asking for redundant approval; do not invent new work just to keep running. Respect explicit approval requirements and user constraints.
+When the policy permits an authorized next action, state that action rather than asking routine permission to continue. For a genuinely unresolved multiple-choice question, call jev_choose with the question, relevant context, and concrete options instead of asking in prose or using another question tool.
 Call jev_choose alone, without other tools in the same batch; wait for its result before acting on the choice.
 Set requiresApproval to true for destructive operations, deployment, purchases, permission changes, access to secrets, or a request for explicit human authorization. Do not rephrase approval as a routine implementation choice.
 Never treat this loop or an automatic choice as human authorization. If jev_choose cannot answer, stop and wait for the user.`;
 
 const ACTIONS = {
-  implement: "Implement the next concrete change proposed in your last report.",
+  implement: "Complete the next unfinished deliverable proposed in your last report, whether code, a plan, or documentation.",
   fix: "Diagnose and fix the concrete failure identified in your last report.",
-  verify: "Run the next relevant verification proposed in your last report and inspect the result.",
+  verify: "Perform the next inspection or verification proposed in your last report and report the evidence.",
   improve: "Make the concrete, goal-scoped improvement proposed in your last report; verify its effect.",
 } as const;
 
@@ -47,6 +49,7 @@ export default function jevContinue(pi: ExtensionAPI) {
   // 実行停止と無効化は分離し、セッション内では /jev-off だけが有効状態を解除する。
   let waitingForInput = false;
   let goal = "";
+  let policy: ContinuationPolicy = EMPTY_POLICY;
   // count は最初の実行を除く自動継続回数。max === 0 は無制限。
   let count = 0;
   let max = 0;
@@ -99,22 +102,32 @@ export default function jevContinue(pi: ExtensionAPI) {
       notify(ctx, "TYPESAFE_API_KEY is required. Set it before starting pi.", true);
       return false;
     }
+    let nextPolicy: ContinuationPolicy;
+    try {
+      nextPolicy = loadContinuationPolicy(ctx.cwd);
+    } catch (error) {
+      stopIteration(ctx, "continuation policy could not be loaded");
+      if (error instanceof Error) notify(ctx, error.message, true);
+      return false;
+    }
     cancelRequest();
     choiceTool.reset();
     pendingGoal = undefined;
     goal = nextGoal;
+    policy = nextPolicy;
     count = 0;
     previousReport = null;
     enabled = true;
     reason = "working";
     updateStatus(ctx);
-    pi.appendEntry("jev-continue-state", { enabled, goal, count, max, reason });
+    pi.appendEntry("jev-continue-state", { enabled, goal, policy, count, max, reason });
     return true;
   };
-  const directive = (action: string) => `${action}\n\n${REPORT_INSTRUCTIONS}\n\nGoal:\n${goal}`;
+  const directive = (action: string) => `${action}\n\n${REPORT_INSTRUCTIONS}\n\n${POLICY_INSTRUCTIONS}\n\npolicy (fixed activation snapshot):\n${JSON.stringify(policy)}\n\nGoal:\n${goal}`;
 
   const choiceTool = registerChoiceTool(pi, {
     getGoal: () => enabled ? goal : undefined,
+    getPolicy: () => policy,
     getConversation: (ctx) => historyCount === 0 ? [] : extractConversation(ctx.sessionManager.buildSessionProjection().messages, historyCount),
     getRequestOptions: getJevOptions,
     waitForHuman: stopIteration,
@@ -148,6 +161,7 @@ export default function jevContinue(pi: ExtensionAPI) {
     removeTerminalListener = undefined;
     enabled = false;
     goal = "";
+    policy = EMPTY_POLICY;
     count = 0;
     max = 0;
     historyCount = DEFAULT_HISTORY_COUNT;
@@ -239,7 +253,7 @@ export default function jevContinue(pi: ExtensionAPI) {
     reason = "judging";
     updateStatus(ctx);
     try {
-      const state = buildState(goal, messages, previousReport, count + 1, historyCount);
+      const state = buildState(goal, messages, previousReport, count + 1, historyCount, policy);
       const result = await judge(state, getJevOptions(signal));
       // await 中に停止・新規開始・セッション切替が起きたら、通知もログも残さない。
       if (generation !== ticket || !enabled) return;
@@ -308,8 +322,8 @@ export default function jevContinue(pi: ExtensionAPI) {
     handler: async (_args, ctx) => disable(ctx, "stopped by user"),
   });
   pi.registerCommand("jev-status", {
-    description: "Show Jev continuation state, goal, and JSONL log path",
-    handler: async (_args, ctx) => notify(ctx, `${status()}${goal ? `\nGoal: ${goal}` : ""}\nHistory messages: ${historyCount}\nJSONL log: ${getJevLogPath()}`),
+    description: "Show Jev continuation state, goal, policy sources, and JSONL log path",
+    handler: async (_args, ctx) => notify(ctx, `${status()}${goal ? `\nGoal: ${goal}` : ""}\nPolicy sources (activation snapshot): ${policy.length ? policy.map(source => `${source.scope}: ${source.path}`).join("; ") : "none (defaults)"}\nHistory messages: ${historyCount}\nJSONL log: ${getJevLogPath()}`),
   });
   pi.registerCommand("jev-max", {
     description: "Set continuation limit: /jev-max <integer>; 0 means unlimited",

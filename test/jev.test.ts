@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { judge } from "../src/jev.ts";
 import type { JudgmentState } from "../src/state.ts";
+import { EMPTY_POLICY } from "../src/policy.ts";
 import { isolateJevLogs } from "./log-environment.ts";
 
 isolateJevLogs();
@@ -13,6 +14,7 @@ const state: JudgmentState = {
   conversation: [],
   recentTools: [],
   iteration: 1,
+  policy: EMPTY_POLICY,
 };
 const options = {
   apiKey: "test-secret-key",
