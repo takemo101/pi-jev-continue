@@ -3,6 +3,7 @@ import { Value } from "typebox/value";
 import { parseChoice, parseEnvelope, parseNoul, requestJev, type JevRequestOptions } from "./client.ts";
 import { INPUT_LIMITS, type ConversationMessage } from "./state.ts";
 import { POLICY_INSTRUCTIONS, type ContinuationPolicy } from "./policy.ts";
+import { getJudgmentThresholds, type JudgmentLevel } from "./thresholds.ts";
 
 export const ChoiceQuestionSchema = Type.Object({
   question: Type.String({ minLength: 1, maxLength: 2000, pattern: "\\S", description: "One concrete decision to resolve, written in the user's language." }),
@@ -26,10 +27,6 @@ export interface QuestionState {
 export type ChoiceJudgment =
   | { action: "answer"; optionIndex: number; reason: string; model: string; answers: unknown; usage: unknown }
   | { action: "defer"; reason: string; model: string | null; answers: unknown; usage: unknown };
-
-const MIN_CONFIDENCE = 0.85;
-const MAX_NEEDS_HUMAN = 0.1;
-const MIN_IN_SCOPE = 0.9;
 
 /** 自由文の推測や既定値の補完をせず、構造と意味上の制約を検証する。 */
 export function parseQuestion(value: unknown): ChoiceQuestion {
@@ -115,7 +112,9 @@ function buildQuestions(question: ChoiceQuestion): Record<string, unknown> {
 export async function judgeQuestion(
   input: QuestionState,
   options: JevRequestOptions,
+  level: JudgmentLevel,
 ): Promise<ChoiceJudgment> {
+  const thresholds = getJudgmentThresholds(level);
   const { goal, question, conversation, policy } = input;
   const parsed = parseQuestion(question);
   if (!goal.trim() || goal.length > INPUT_LIMITS.goalCharacters) {
@@ -134,19 +133,19 @@ export async function judgeQuestion(
   const needsHuman = parseNoul(response.answers.needs_human);
   // 非選択候補の値も契約検証は行うが、スコープの方針判定には選択候補だけを使う。
   const scopes = keys.map((_, index) => parseNoul(response.answers[`in_scope_${index}`]));
-  if (needsHuman > MAX_NEEDS_HUMAN) {
-    return { ...response, action: "defer", reason: `Human dependency is not safely ruled out (${needsHuman} > ${MAX_NEEDS_HUMAN}).` };
+  if (needsHuman > thresholds.maxNeedsHuman) {
+    return { ...response, action: "defer", reason: `Human dependency is not safely ruled out (${needsHuman} > ${thresholds.maxNeedsHuman}).` };
   }
-  if (selection.confidence < MIN_CONFIDENCE) {
-    return { ...response, action: "defer", reason: `Answer confidence is too low (${selection.confidence} < ${MIN_CONFIDENCE}).` };
+  if (selection.confidence < thresholds.minConfidence) {
+    return { ...response, action: "defer", reason: `Answer confidence is too low (${selection.confidence} < ${thresholds.minConfidence}).` };
   }
   if (selection.choice === "defer") {
     return { ...response, action: "defer", reason: "Jev deferred because no single suitable answer was established." };
   }
   const optionIndex = keys.indexOf(selection.choice);
   const inScope = scopes[optionIndex];
-  if (inScope === undefined || inScope < MIN_IN_SCOPE) {
-    return { ...response, action: "defer", reason: `The selected answer is not confidently within the goal (${inScope} < ${MIN_IN_SCOPE}).` };
+  if (inScope === undefined || inScope < thresholds.minInScope) {
+    return { ...response, action: "defer", reason: `The selected answer is not confidently within the goal (${inScope} < ${thresholds.minInScope}).` };
   }
   return {
     ...response,

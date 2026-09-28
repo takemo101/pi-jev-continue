@@ -4,10 +4,12 @@ import type { JevRequestOptions } from "./client.ts";
 import { askHumanQuestion, type HumanAnswer } from "./human-question.ts";
 import type { ConversationMessage } from "./state.ts";
 import type { ContinuationPolicy } from "./policy.ts";
+import type { JudgmentLevel } from "./thresholds.ts";
 
 export interface ChoiceToolHooks {
   getGoal(): string | undefined;
   getPolicy(): ContinuationPolicy;
+  getLevel(): JudgmentLevel;
   getConversation(ctx: ExtensionContext): ConversationMessage[];
   getRequestOptions(signal: AbortSignal): JevRequestOptions;
   waitForHuman(ctx: ExtensionContext, reason: string): void;
@@ -173,11 +175,13 @@ export function registerChoiceTool(pi: ExtensionAPI, hooks: ChoiceToolHooks): Ch
         if (goal !== undefined && !question.requiresApproval) {
           try {
             const requestSignal = AbortSignal.any([operation.signal, AbortSignal.timeout(hooks.timeoutMs)]);
+            const level = hooks.getLevel();
             const input = { goal, policy: hooks.getPolicy(), question, conversation: hooks.getConversation(ctx) };
-            const judgment = await waitFor(judgeQuestion(input, hooks.getRequestOptions(requestSignal)), requestSignal);
+            const judgment = await waitFor(judgeQuestion(input, hooks.getRequestOptions(requestSignal), level), requestSignal);
             if (!isFresh(operation)) return cancelled(question, operation, ctx);
-            // 設定・質問本文・未検証の追加メタデータを永続ログへ流さない。
+            // 判定レベル以外の設定・質問本文・未検証の追加メタデータを永続ログへ流さない。
             pi.appendEntry("jev-choice-judgment", {
+              level,
               action: judgment.action,
               reason: judgment.reason,
               ...(judgment.action === "answer" ? { optionIndex: judgment.optionIndex } : {}),

@@ -132,13 +132,13 @@ function boundary(outcome: AgentBeforeSettleEvent["outcome"] = "completed"): Age
   };
 }
 
-function answer(choice: "verify" | "other" = "verify") {
+function answer(choice: "verify" | "other" = "verify", confidence = 0.95, needsHuman = 0.01, inScope = 0.99) {
   return Response.json({
     model: "jev-1.13.0", usage: { input_tokens: 100, output_tokens: 20 },
     answers: {
-      next_step: { type: "choice", choice, confidence: 0.95,
+      next_step: { type: "choice", choice, confidence,
         probabilities: { implement: 0.01, fix: 0.01, verify: choice === "verify" ? 0.96 : 0.01, improve: 0.01, other: choice === "other" ? 0.96 : 0.01 } },
-      needs_human: { type: "noul", noul: 0.01 }, in_scope: { type: "noul", noul: 0.99 },
+      needs_human: { type: "noul", noul: needsHuman }, in_scope: { type: "noul", noul: inScope },
     },
   });
 }
@@ -388,15 +388,15 @@ const implementationQuestion = {
   requiresApproval: false,
 };
 
-function questionAnswer(needsHuman = 0.01) {
+function questionAnswer(needsHuman = 0.01, confidence = 0.95, inScope = 0.99) {
   return Response.json({
     model: "jev-1.13.0", usage: { input_tokens: 100, output_tokens: 20 },
     answers: {
-      selection: { type: "choice", choice: "option_1", confidence: 0.95,
+      selection: { type: "choice", choice: "option_1", confidence,
         probabilities: { option_0: 0.01, option_1: 0.98, defer: 0.01 } },
       needs_human: { type: "noul", noul: needsHuman },
       in_scope_0: { type: "noul", noul: 0.01 },
-      in_scope_1: { type: "noul", noul: 0.99 },
+      in_scope_1: { type: "noul", noul: inScope },
     },
   });
 }
@@ -756,4 +756,155 @@ test("policy files stay frozen during a run and are reloaded only on explicit ac
   assert.equal(h.sent.length, 2);
   assert.ok(h.emit("before_agent_start"));
   assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
+});
+
+test("level command reports thresholds without enabling automation and rejects invalid changes", async (t) => {
+  const h = harness(t);
+  await h.command("jev-level");
+  assert.match(h.notifications.at(-1)!, /Level: 5\b/);
+  for (const value of ["0.85", "0.1", "0.9"]) assert.ok(h.notifications.at(-1)!.includes(value));
+  for (const [value, confidence, needsHuman, inScope] of [
+    ["1", "0.65", "0.3", "0.7"],
+    ["2", "0.7", "0.25", "0.75"],
+    ["3", "0.75", "0.2", "0.8"],
+    ["4", "0.8", "0.15", "0.85"],
+    ["5", "0.85", "0.1", "0.9"],
+  ] as const) {
+    await h.command("jev-level", value);
+    await h.command("jev-status");
+    const message = h.notifications.at(-1)!;
+    assert.match(message, new RegExp(`Level: ${value}\\b`));
+    assert.match(message, new RegExp(`minConfidence: ${confidence.replace(".", "\\.")}(?:[, )]|$)`));
+    assert.match(message, new RegExp(`maxNeedsHuman: ${needsHuman.replace(".", "\\.")}(?:[, )]|$)`));
+    assert.match(message, new RegExp(`minInScope: ${inScope.replace(".", "\\.")}(?:[, )]|$)`));
+  }
+  await h.command("jev-level", " 3 ");
+  for (const invalid of ["0", "6", "-1", "1.5", "03", "3x", "3 4", "NaN", "Infinity"]) {
+    await h.command("jev-level", invalid);
+    await h.command("jev-level");
+    assert.match(h.notifications.at(-1)!, /Level: 3\b/);
+  }
+  await h.command("jev-status");
+  assert.match(h.notifications.at(-1)!, /Level: 3\b/);
+  for (const value of ["0.75", "0.2", "0.8"]) assert.ok(h.notifications.at(-1)!.includes(value));
+  assert.match(h.status(), /^Jev off\b/);
+  assert.equal(h.emit("before_agent_start"), undefined);
+  assert.equal(h.sent.length, 0);
+});
+
+for (const activation of ["command", "cli"] as const) {
+  test(`${activation} level applies to both judge paths and preserves the active goal, policy, and limit`, async (t) => {
+    const h = harness(t, activation === "cli" ? { "jev-goal": "Verify parser behavior", "jev-level": "3", "jev-max": "2" } : {});
+    const policyPath = join(h.ctx.cwd, ".pi", "CONTINUE.md");
+    writeFileSync(policyPath, "Continue local verification.");
+    const captured: { goal: string; policy: unknown }[] = [];
+    t.mock.method(globalThis, "fetch", async (_url: unknown, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body));
+      captured.push({ goal: body.state.goal, policy: body.state.policy });
+      return body.questions.selection ? questionAnswer(0.18, 0.78, 0.82) : answer("verify", 0.78, 0.18, 0.82);
+    });
+    if (activation === "command") {
+      await h.command("jev-max", "2");
+      await h.command("jev-on", "Verify parser behavior");
+      await h.command("jev-level", "3");
+    }
+    assert.ok(h.emit("before_agent_start"));
+    assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
+    writeFileSync(policyPath, "A changed policy must not be loaded by a level change.");
+    await h.command("jev-level", "1");
+    const result = await h.choose(implementationQuestion);
+    assert.ok(result.details && typeof result.details === "object" && "source" in result.details);
+    assert.equal(result.details.source, "jev");
+    assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
+    assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+    assert.match(h.status(), /on 2\/2/);
+    assert.deepEqual(captured, [captured[0], captured[0], captured[0]]);
+    assert.equal(captured[0].goal, "Verify parser behavior");
+    assert.equal(h.sent.length, activation === "command" ? 1 : 0);
+    assert.deepEqual(h.entries.filter(entry => entry.type === "jev-judgment" || entry.type === "jev-choice-judgment")
+      .map(entry => {
+        assert.ok(entry.data && typeof entry.data === "object" && "level" in entry.data);
+        return entry.data.level;
+      }), [3, 1, 1]);
+  });
+}
+
+for (const value of ["0", "6", "1.5", "03", "2x", " 3 ", ""]) {
+  test(`invalid startup level ${JSON.stringify(value)} prevents CLI activation`, async (t) => {
+    const h = harness(t, { "jev-goal": "Verify parser behavior", "jev-level": value });
+    assert.equal(h.emit("before_agent_start"), undefined);
+    assert.match(h.status(), /^Jev off\b/);
+    await h.command("jev-level");
+    assert.match(h.notifications.at(-1)!, /Level: 5\b/);
+  });
+}
+
+for (const reason of ["new", "reload", "switch"] as const) {
+  test(`${reason} resets the level without reapplying startup settings`, async (t) => {
+    const h = harness(t, { "jev-goal": "Verify parser behavior", "jev-level": "1" });
+    assert.ok(h.emit("before_agent_start"));
+    await h.command("jev-level", "2");
+    h.emit("session_start", { reason });
+    await h.command("jev-level");
+    assert.match(h.notifications.at(-1)!, /Level: 5\b/);
+    assert.equal(h.emit("before_agent_start"), undefined);
+    assert.match(h.status(), /^Jev off\b/);
+  });
+}
+
+test("a pending continuation retains its level while later requests use the changed level", async (t) => {
+  const h = harness(t);
+  const waiting = deferred();
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", () => ++calls === 1 ? waiting.promise : Promise.resolve(answer("verify", 0.78, 0.18, 0.82)));
+  await h.command("jev-on", "Verify parser behavior");
+  const pending = h.emit("agent_before_settle", boundary());
+  await h.command("jev-level", "3");
+  waiting.resolve(answer("verify", 0.78, 0.18, 0.82));
+  assert.equal(await pending, undefined, "The pending level-5 judgment must still stop");
+  await h.command("jev-level", "4");
+  await h.command("jev-level", "3");
+  assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+  assert.equal(calls, 1, "A level change must not restart a stopped run");
+  h.emit("input", { source: "interactive", text: "Continue verification." });
+  assert.ok(h.emit("before_agent_start"));
+  assert.equal((await h.emit("agent_before_settle", boundary()))?.continue, true);
+  assert.deepEqual(h.entries.filter(entry => entry.type === "jev-judgment")
+    .map(entry => {
+      assert.ok(entry.data && typeof entry.data === "object" && "level" in entry.data);
+      return entry.data.level;
+    }), [5, 3]);
+});
+
+test("changing level during a pending question neither rejudges nor resolves its human handoff", async (t) => {
+  const h = harness(t);
+  const waiting = deferred();
+  const selection = Promise.withResolvers<string | undefined>();
+  h.setSelect(() => selection.promise);
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", () => ++calls === 1 ? waiting.promise : Promise.resolve(questionAnswer(0.18, 0.78, 0.82)));
+  await h.command("jev-on", "Verify parser behavior");
+  const pending = h.choose(implementationQuestion);
+  await h.command("jev-level", "3");
+  waiting.resolve(questionAnswer(0.18, 0.78, 0.82));
+  const choices = await h.dialogOpened.promise;
+  await h.command("jev-level", "1");
+  const blocked = h.emit("tool_call", { toolName: "write" });
+  assert.ok(blocked && typeof blocked === "object" && "block" in blocked && blocked.block);
+  assert.equal(await h.emit("agent_before_settle", boundary()), undefined);
+  assert.equal(calls, 1);
+  assert.match(h.status(), /on 0\/unlimited/);
+  selection.resolve(choices[1]);
+  const human = await pending;
+  assert.ok(human.details && typeof human.details === "object" && "source" in human.details);
+  assert.equal(human.details.source, "human");
+  const automatic = await h.choose(implementationQuestion);
+  assert.ok(automatic.details && typeof automatic.details === "object" && "source" in automatic.details);
+  assert.equal(automatic.details.source, "jev");
+  assert.deepEqual(h.entries.filter(entry => entry.type === "jev-choice-judgment")
+    .map(entry => {
+      assert.ok(entry.data && typeof entry.data === "object" && "level" in entry.data);
+      return entry.data.level;
+    }), [5, 1]);
+  assert.equal(h.sent.length, 1);
 });

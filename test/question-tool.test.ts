@@ -5,6 +5,7 @@ import type { AgentToolResult, ExtensionAPI, ExtensionContext, ExtensionUIDialog
 import type { ChoiceQuestion, ChoiceQuestionSchema } from "../src/choice.ts";
 import { registerChoiceTool, type ChoiceToolDetails } from "../src/question-tool.ts";
 import { isolateJevLogs } from "./log-environment.ts";
+import { DEFAULT_JUDGMENT_LEVEL, type JudgmentLevel } from "../src/thresholds.ts";
 
 isolateJevLogs();
 
@@ -24,6 +25,7 @@ interface HarnessOptions {
   hasUI?: boolean;
   mode?: ExtensionContext["mode"];
   timeoutMs?: number;
+  getLevel?: () => JudgmentLevel;
   select?: (dialog: Dialog) => Promise<string | undefined>;
   input?: (dialog: NoteDialog) => Promise<string | undefined>;
 }
@@ -89,6 +91,7 @@ function harness(t: TestContext, options: HarnessOptions = {}) {
   const controller = registerChoiceTool(pi, {
     getGoal: () => goal,
     getPolicy: () => [],
+    getLevel: options.getLevel ?? (() => DEFAULT_JUDGMENT_LEVEL),
     getConversation: () => [],
     getRequestOptions: (signal) => ({ apiKey: "test-only-secret", model: "jev-1.13.0", signal }),
     waitForHuman(_ctx, reason) {
@@ -472,4 +475,26 @@ test("overlimit notes remain editable without accepting or silently truncating t
   if (result.details.status === "answered" && result.details.source === "human") {
     assert.equal(result.details.notes, "x".repeat(2000));
   }
+});
+
+test("a question snapshots its level before HTTP and records that level after settings change", async (t) => {
+  let level: JudgmentLevel = 1;
+  const h = harness(t, { getLevel: () => level });
+  const waiting = Promise.withResolvers<Response>();
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", () => ++calls === 1 ? waiting.promise : Promise.resolve(response(0.7)));
+  const pending = h.execute();
+  level = 5;
+  waiting.resolve(response(0.7));
+  const automatic = await pending;
+  assert.equal(automatic.details.status, "answered");
+  if (automatic.details.status === "answered") assert.equal(automatic.details.source, "jev");
+  assert.equal(h.dialogs.length, 0);
+  const manual = await h.execute();
+  assert.equal(manual.details.status, "answered");
+  if (manual.details.status === "answered") assert.equal(manual.details.source, "human");
+  assert.deepEqual(h.entries.map(entry => {
+    assert.ok(entry.data && typeof entry.data === "object" && "level" in entry.data);
+    return entry.data.level;
+  }), [1, 5]);
 });

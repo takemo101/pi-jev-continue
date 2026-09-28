@@ -4,6 +4,7 @@ import { judgeQuestion, parseQuestion, type ChoiceQuestion } from "../src/choice
 import { EMPTY_POLICY, type ContinuationPolicy } from "../src/policy.ts";
 import { INPUT_LIMITS } from "../src/state.ts";
 import { isolateJevLogs } from "./log-environment.ts";
+import { getJudgmentThresholds, type JudgmentLevel } from "../src/thresholds.ts";
 
 isolateJevLogs();
 
@@ -35,29 +36,59 @@ function fixture(choice = "option_1", confidence = 0.95, human = 0, scopes = [0,
   };
 }
 
-// 固定応答で制御方針を検証する。実モデルの正答率や注入耐性を証明するテストではない。
-test("answers a non-first option when only that option fits the goal", async (t) => {
-  t.mock.method(globalThis, "fetch", async () => Response.json(fixture()));
-  const result = await judgeQuestion({ goal, question, conversation: [], policy: EMPTY_POLICY }, requestOptions);
+test("level 3 answers a choice that level 5 defers", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => Response.json(fixture("option_1", 0.78, 0.18, [0, 0.82])));
+  const input = { goal, question, conversation: [], policy: EMPTY_POLICY };
+  assert.equal((await judgeQuestion(input, requestOptions, 5)).action, "defer");
+  const result = await judgeQuestion(input, requestOptions, 3);
   assert.equal(result.action, "answer");
   if (result.action === "answer") assert.equal(result.optionIndex, 1);
 });
 
-test("accepts inclusive confidence, human, and selected-scope boundaries", async (t) => {
-  t.mock.method(globalThis, "fetch", async () => Response.json(fixture("option_1", 0.85, 0.1, [0, 0.9])));
-  assert.equal((await judgeQuestion({ goal, question, conversation: [], policy: EMPTY_POLICY }, requestOptions)).action, "answer");
+// 固定応答で制御方針を検証する。実モデルの正答率や注入耐性を証明するテストではない。
+test("answers a non-first option when only that option fits the goal", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => Response.json(fixture()));
+  const result = await judgeQuestion({ goal, question, conversation: [], policy: EMPTY_POLICY }, requestOptions, 5);
+  assert.equal(result.action, "answer");
+  if (result.action === "answer") assert.equal(result.optionIndex, 1);
 });
 
+const boundaries = [
+  { level: 1, confidence: 0.65, human: 0.3, scope: 0.7 },
+  { level: 2, confidence: 0.7, human: 0.25, scope: 0.75 },
+  { level: 3, confidence: 0.75, human: 0.2, scope: 0.8 },
+  { level: 4, confidence: 0.8, human: 0.15, scope: 0.85 },
+  { level: 5, confidence: 0.85, human: 0.1, scope: 0.9 },
+] as const;
+
+for (const { level, confidence, human, scope } of boundaries) {
+  test(`level ${level} accepts inclusive confidence, human, and selected-scope boundaries`, async (t) => {
+    t.mock.method(globalThis, "fetch", async () => Response.json(fixture("option_1", confidence, human, [0, scope])));
+    const result = await judgeQuestion({ goal, question, conversation: [], policy: EMPTY_POLICY }, requestOptions, level);
+    assert.equal(result.action, "answer");
+    if (result.action === "answer") assert.equal(result.optionIndex, 1);
+  });
+  for (const scenario of [
+    { name: "confidence below the floor", body: fixture("option_1", confidence - 0.000001, human, [0, scope]), reason: /confidence/i },
+    { name: "human dependency above the ceiling", body: fixture("option_1", confidence, human + 0.000001, [0, scope]), reason: /human/i },
+    { name: "selected scope below the floor despite another fitting", body: fixture("option_0", confidence, human, [scope - 0.000001, 1]), reason: /goal/i },
+  ]) {
+    test(`level ${level} defers for ${scenario.name}`, async (t) => {
+      t.mock.method(globalThis, "fetch", async () => Response.json(scenario.body));
+      const result = await judgeQuestion({ goal, question, conversation: [], policy: EMPTY_POLICY }, requestOptions, level);
+      assert.equal(result.action, "defer");
+      assert.match(result.reason, scenario.reason);
+    });
+  }
+}
+
 for (const scenario of [
-  { name: "low confidence", body: fixture("option_1", 0.849999), reason: /confidence/i },
   { name: "explicit defer", body: fixture("defer"), reason: /defer|suitable/i },
-  { name: "selected option outside scope despite another fitting", body: fixture("option_0", 0.95, 0, [0.899999, 1]), reason: /goal/i },
-  { name: "human veto on a mislabelled ordinary question", body: fixture("option_1", 0.95, 0.100001), reason: /human/i },
   { name: "human veto before low confidence and scope", body: fixture("defer", 0.2, 1, [0, 0]), reason: /human/i },
 ]) {
-  test(`defers for ${scenario.name}`, async (t) => {
+  test(`level 1 defers for ${scenario.name}`, async (t) => {
     t.mock.method(globalThis, "fetch", async () => Response.json(scenario.body));
-    const result = await judgeQuestion({ goal, question, conversation: [], policy: EMPTY_POLICY }, requestOptions);
+    const result = await judgeQuestion({ goal, question, conversation: [], policy: EMPTY_POLICY }, requestOptions, 1);
     assert.equal(result.action, "defer");
     assert.match(result.reason, scenario.reason);
   });
@@ -68,7 +99,7 @@ test("explicit approval defers without contacting Jev even when policy delegates
   const result = await judgeQuestion({
     goal, question: { ...question, requiresApproval: true }, conversation: [],
     policy: [{ scope: "project", path: "/project/.pi/CONTINUE.md", text: "Delegate all routine decisions to the agent." }],
-  }, requestOptions);
+  }, requestOptions, 1);
   assert.equal(result.action, "defer");
   assert.equal(result.model, null);
   assert.equal(fetchMock.mock.callCount(), 0);
@@ -84,7 +115,7 @@ test("injection-shaped labels remain option data rather than response keys", asy
   };
   t.mock.method(globalThis, "fetch", async () => Response.json(fixture()));
   const parsed = parseQuestion(injected);
-  const result = await judgeQuestion({ goal, question: parsed, conversation: [], policy: EMPTY_POLICY }, requestOptions);
+  const result = await judgeQuestion({ goal, question: parsed, conversation: [], policy: EMPTY_POLICY }, requestOptions, 1);
   assert.equal(result.action, "answer");
   if (result.action === "answer") assert.equal(parsed.options[result.optionIndex]?.label, injected.options[1].label);
 });
@@ -116,7 +147,7 @@ for (const scenario of [
 ]) {
   test(`rejects ${scenario.name} rather than silently handing off`, async (t) => {
     t.mock.method(globalThis, "fetch", async () => Response.json(scenario.body));
-    await assert.rejects(judgeQuestion({ goal, question, conversation: [], policy: EMPTY_POLICY }, requestOptions), /invalid judgment response/i);
+    await assert.rejects(judgeQuestion({ goal, question, conversation: [], policy: EMPTY_POLICY }, requestOptions, 1), /invalid judgment response/i);
   });
 }
 
@@ -141,7 +172,7 @@ for (const scenario of [
 test("rejects empty or oversized goal before network access", async (t) => {
   const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(fixture()));
   for (const badGoal of [" ", "x".repeat(4001)]) {
-    await assert.rejects(judgeQuestion({ goal: badGoal, question, conversation: [], policy: EMPTY_POLICY }, requestOptions), /goal/i);
+    await assert.rejects(judgeQuestion({ goal: badGoal, question, conversation: [], policy: EMPTY_POLICY }, requestOptions, 1), /goal/i);
   }
   assert.equal(fetchMock.mock.callCount(), 0);
 });
@@ -149,7 +180,7 @@ test("rejects empty or oversized goal before network access", async (t) => {
 test("enforces UTF-8 budget on the combined goal and question without truncating", async (t) => {
   const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(fixture()));
   const large = { ...question, context: "界".repeat(6000) };
-  await assert.rejects(judgeQuestion({ goal: "界".repeat(4000), question: large, conversation: [], policy: EMPTY_POLICY }, requestOptions), /byte.*budget|budget/i);
+  await assert.rejects(judgeQuestion({ goal: "界".repeat(4000), question: large, conversation: [], policy: EMPTY_POLICY }, requestOptions, 1), /byte.*budget|budget/i);
   assert.equal(fetchMock.mock.callCount(), 0);
 });
 
@@ -158,10 +189,10 @@ test("counts complete UTF-8 policy text at the question state budget boundary", 
   const policy: ContinuationPolicy = [{ scope: "project", path: "/project/.pi/CONTINUE.md", text: "界".repeat(2000) }];
   const state = { goal, question, conversation: [{ role: "user" as const, text: "" }], policy };
   state.conversation[0]!.text = "r".repeat(INPUT_LIMITS.stateBytes - Buffer.byteLength(JSON.stringify(state), "utf8"));
-  assert.equal((await judgeQuestion(state, requestOptions)).action, "answer");
+  assert.equal((await judgeQuestion(state, requestOptions, 1)).action, "answer");
   await assert.rejects(judgeQuestion({
     ...state, policy: [{ ...policy[0]!, text: `${policy[0]!.text}界` }],
-  }, requestOptions), /byte.*budget/);
+  }, requestOptions, 1), /byte.*budget/);
   assert.equal(fetchMock.mock.callCount(), 1);
 });
 
@@ -169,7 +200,7 @@ test("already-aborted questions never contact the service", async (t) => {
   const controller = new AbortController();
   controller.abort(new Error("private cancellation reason"));
   const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(fixture()));
-  await assert.rejects(judgeQuestion({ goal, question, conversation: [], policy: EMPTY_POLICY }, { ...requestOptions, signal: controller.signal }), { name: "AbortError" });
+  await assert.rejects(judgeQuestion({ goal, question, conversation: [], policy: EMPTY_POLICY }, { ...requestOptions, signal: controller.signal }, 1), { name: "AbortError" });
   assert.equal(fetchMock.mock.callCount(), 0);
 });
 
@@ -177,7 +208,7 @@ test("an abort discards even a late successful response", async (t) => {
   const controller = new AbortController();
   const response = Promise.withResolvers<Response>();
   t.mock.method(globalThis, "fetch", async () => response.promise);
-  const pending = judgeQuestion({ goal, question, conversation: [], policy: EMPTY_POLICY }, { ...requestOptions, signal: controller.signal });
+  const pending = judgeQuestion({ goal, question, conversation: [], policy: EMPTY_POLICY }, { ...requestOptions, signal: controller.signal }, 1);
   controller.abort();
   response.resolve(Response.json(fixture()));
   await assert.rejects(pending, { name: "AbortError" });
@@ -188,7 +219,7 @@ test("snapshots options before asynchronous selection so callers cannot change t
   const response = Promise.withResolvers<Response>();
   t.mock.method(globalThis, "fetch", async () => response.promise);
   const snapshot = parseQuestion(mutable);
-  const pending = judgeQuestion({ goal, question: snapshot, conversation: [], policy: EMPTY_POLICY }, requestOptions);
+  const pending = judgeQuestion({ goal, question: snapshot, conversation: [], policy: EMPTY_POLICY }, requestOptions, 1);
   mutable.options[1]!.label = "Delete all data";
   mutable.options.reverse();
   response.resolve(Response.json(fixture()));
@@ -214,6 +245,33 @@ test("history participates in the question state byte budget before HTTP", async
   const fetch = t.mock.method(globalThis, "fetch", async () => Response.json(fixture()));
   await assert.rejects(judgeQuestion({
     goal, question, conversation: [{ role: "user", text: "制".repeat(8000) }], policy: EMPTY_POLICY,
-  }, requestOptions), /byte.*budget/);
+  }, requestOptions, 1), /byte.*budget/);
   assert.equal(fetch.mock.callCount(), 0);
+});
+
+test("invalid runtime levels reject before HTTP or approval handoff", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(fixture()));
+  for (const level of [0, 6, -1, 1.5, NaN, Infinity, "1", undefined, null]) {
+    for (const requiresApproval of [false, true]) {
+      const input = { goal, question: { ...question, requiresApproval }, conversation: [], policy: EMPTY_POLICY };
+      await assert.rejects(Reflect.apply(judgeQuestion, undefined, [input, requestOptions, level]), /judgment level/i);
+    }
+  }
+  assert.equal(fetchMock.mock.callCount(), 0);
+});
+
+test("an in-flight choice retains its level and rejects threshold mutation", async (t) => {
+  const response = Promise.withResolvers<Response>();
+  t.mock.method(globalThis, "fetch", async () => (await response.promise).clone());
+  let level: JudgmentLevel = 1;
+  const input = { goal, question, conversation: [], policy: EMPTY_POLICY };
+  const pending = judgeQuestion(input, requestOptions, level);
+  assert.equal(Reflect.set(getJudgmentThresholds(level), "maxNeedsHuman", 0), false);
+  assert.equal(Reflect.set(getJudgmentThresholds(level), "minInScope", 1), false);
+  level = 5;
+  response.resolve(Response.json(fixture("option_1", 0.65, 0.3, [0, 0.7])));
+  const result = await pending;
+  assert.equal(result.action, "answer");
+  if (result.action === "answer") assert.equal(result.optionIndex, 1);
+  assert.equal((await judgeQuestion(input, requestOptions, level)).action, "defer");
 });
