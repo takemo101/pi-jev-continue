@@ -1,7 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { AgentBeforeSettleEventResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
-import type { JevRequestOptions } from "./client.ts";
+import { resolveJevEndpoint, type JevRequestOptions } from "./client.ts";
 import { judge } from "./jev.ts";
 import { buildState, DEFAULT_HISTORY_COUNT, extractConversation, INPUT_LIMITS } from "./state.ts";
 import { registerChoiceTool } from "./question-tool.ts";
@@ -12,6 +12,32 @@ import { DEFAULT_JUDGMENT_LEVEL, getJudgmentThresholds, parseJudgmentLevel, type
 const DEFAULT_MODEL = "jev-1.13.0";
 const JUDGMENT_TIMEOUT_MS = 30_000;
 
+const SUBCOMMANDS = ["help", "on", "off", "status", "level", "max", "history"];
+const HELP = `Usage: /jev-continue <command>
+
+  help           Show this help
+  on <goal>      Start; omit goal to reuse it
+  off            Disable and cancel judgment
+  status         Show state and configuration
+  level [1..5]   Show/set judgment strictness
+  max <n>        Continuation limit; 0 unlimited
+  history <n>    Recent messages; 0 disables
+
+Judgments send reports to the configured API.
+Connection: TYPESAFE_BASE_URL, TYPESAFE_MODEL,
+TYPESAFE_API_KEY. CLI: --jev-goal, --jev-max,
+--jev-history, --jev-level.`;
+
+function safeDisplay(value: string, multiline = false): string {
+  const key = process.env.TYPESAFE_API_KEY?.trim();
+  const masked = key ? value.replaceAll(key, "[REDACTED]") : value;
+  return masked.replace(/[\u0000-\u001f\u007f-\u009f\u2028-\u202e\u2066-\u2069]/g, (character) =>
+    multiline && character === "\n" ? "\n" : `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+function table(heading: string, rows: readonly (readonly [string, string | number])[]): string {
+  return `${heading}\n${rows.map(([label, value]) => `  ${label.padEnd(14)} ${safeDisplay(String(value))}`).join("\n")}`;
+}
 const REPORT_INSTRUCTIONS = `Work in bounded iterations toward the goal below. After each iteration, report concisely:
 - What changed and what execution evidence you observed.
 - One concrete next action for the next iteration within the goal. State the immediate action separately from later planned stages, so a policy stopping point can be evaluated before crossing it. Do not bundle all remaining stages into a single next action.
@@ -41,13 +67,14 @@ function getJevOptions(signal: AbortSignal): JevRequestOptions {
   return {
     apiKey: process.env.TYPESAFE_API_KEY?.trim() ?? "",
     model: process.env.TYPESAFE_MODEL?.trim() || DEFAULT_MODEL,
+    baseUrl: process.env.TYPESAFE_BASE_URL,
     signal,
   };
 }
 
 export default function jevContinue(pi: ExtensionAPI) {
   let enabled = false;
-  // 実行停止と無効化は分離し、セッション内では /jev-off だけが有効状態を解除する。
+  // 実行停止と無効化は分離し、セッション内では /jev-continue off だけが有効状態を解除する。
   let waitingForInput = false;
   let goal = "";
   let policy: ContinuationPolicy = EMPTY_POLICY;
@@ -65,17 +92,23 @@ export default function jevContinue(pi: ExtensionAPI) {
   let request: AbortController | undefined;
   let removeTerminalListener: (() => void) | undefined;
 
-  const status = () => `Jev ${enabled ? "on" : "off"} ${count}/${max || "unlimited"}: ${reason}`;
+  const status = () => safeDisplay(`Jev ${enabled ? "on" : "off"} ${count}/${max || "unlimited"}: ${reason}`);
   const levelStatus = () => {
     const { minConfidence, maxNeedsHuman, minInScope } = getJudgmentThresholds(level);
-    return `Level: ${level} (minConfidence: ${minConfidence}, maxNeedsHuman: ${maxNeedsHuman}, minInScope: ${minInScope})`;
+    return table("Judgment", [
+      ["Level", level],
+      ["Confidence", `>= ${minConfidence.toFixed(2)}`],
+      ["Needs human", `<= ${maxNeedsHuman.toFixed(2)}`],
+      ["Scope fit", `>= ${minInScope.toFixed(2)}`],
+    ]);
   };
   const updateStatus = (ctx: ExtensionContext) => {
     ctx.ui.setStatus("jev-continue", status());
   };
   const notify = (ctx: ExtensionContext, message: string, warning = false) => {
-    if (ctx.hasUI) ctx.ui.notify(message, warning ? "warning" : "info");
-    else process.stderr.write(`[jev-continue] ${message}\n`);
+    const display = safeDisplay(message, true);
+    if (ctx.hasUI) ctx.ui.notify(display, warning ? "warning" : "info");
+    else process.stderr.write(`[jev-continue] ${display}\n`);
   };
   // 停止・再開・セッション切替は必ずここを通し、処理中の結果を無効化する。
   const cancelRequest = () => {
@@ -101,11 +134,17 @@ export default function jevContinue(pi: ExtensionAPI) {
   const activate = (text: string, ctx: ExtensionContext): boolean => {
     const nextGoal = text.trim();
     if (!nextGoal || nextGoal.length > INPUT_LIMITS.goalCharacters) {
-      notify(ctx, `Specify a goal of 1–${INPUT_LIMITS.goalCharacters} characters: /jev-on <goal>`, true);
+      notify(ctx, `Specify a goal of 1–${INPUT_LIMITS.goalCharacters} characters: /jev-continue on <goal>`, true);
       return false;
     }
     if (!process.env.TYPESAFE_API_KEY?.trim()) {
       notify(ctx, "TYPESAFE_API_KEY is required. Set it before starting pi.", true);
+      return false;
+    }
+    try {
+      resolveJevEndpoint(process.env.TYPESAFE_BASE_URL);
+    } catch {
+      notify(ctx, "Invalid TYPESAFE_BASE_URL. Use an absolute HTTP(S) base URL without credentials, query, or fragment.", true);
       return false;
     }
     let nextPolicy: ContinuationPolicy;
@@ -316,69 +355,114 @@ export default function jevContinue(pi: ExtensionAPI) {
     }
   }
 
-  pi.registerCommand("jev-on", {
-    description: "Start continuous development: /jev-on <goal> (sends reports to TypeSafe)",
-    handler: async (args, ctx) => {
-      if (!ctx.isIdle() || ctx.hasPendingMessages() || request || choiceTool.isPending()) {
-        notify(ctx, "Stop the current run before starting a new Jev goal.", true);
-        return;
-      }
-      if (!activate(args || goal, ctx)) return;
-      try {
-        pi.sendUserMessage(`Work toward this goal:\n${goal}`);
-      } catch {
-        stopIteration(ctx, "pi could not start the goal");
-      }
+  const showStatus = (ctx: ExtensionContext) => {
+    let endpoint: string;
+    try {
+      endpoint = resolveJevEndpoint(process.env.TYPESAFE_BASE_URL);
+    } catch {
+      endpoint = "invalid (check TYPESAFE_BASE_URL)";
+    }
+    const activity = choiceTool.isAwaitingHuman() ? "waiting for human answer"
+      : request || choiceTool.isPending() ? "judging"
+      : pendingGoal !== undefined ? "pending initial prompt"
+      : !enabled ? "disabled"
+      : waitingForInput ? "waiting for input"
+      : !ctx.isIdle() || ctx.hasPendingMessages() ? "working" : "idle";
+    const details = [
+      ["Goal", pendingGoal ?? (goal || "(not set)")],
+      ["Reason", reason],
+      ["Endpoint", endpoint],
+      ["Policy sources (activation snapshot)", policy.length
+        ? policy.map(source => `${source.scope}: ${source.path}`).join("\n") : "none (defaults)"],
+      ["JSONL log", getJevLogPath()],
+    ];
+    // 長い目標やパスで、狭い端末の画面末尾から状態表が押し出されないようにする。
+    notify(ctx, [
+      ...details.map(([label, value]) => `${label}\n${safeDisplay(value, true).split("\n").map(line => `  ${line}`).join("\n")}`),
+      table("State", [
+        ["Automation", enabled ? "enabled" : "disabled"],
+        ["Activity", activity],
+        ["Continuations", `${count} / ${max || "unlimited"}`],
+        ["History", `${historyCount} messages`],
+      ]),
+      levelStatus(),
+      table("Connection", [
+        ["Model", process.env.TYPESAFE_MODEL?.trim() || DEFAULT_MODEL],
+        ["API key", process.env.TYPESAFE_API_KEY?.trim() ? "configured" : "missing"],
+      ]),
+    ].join("\n\n"));
+  };
+
+  pi.registerCommand("jev-continue", {
+    description: "Control Jev continuation: help, on, off, status, level, max, history",
+    getArgumentCompletions: (prefix) => {
+      if (/\s/.test(prefix)) return null;
+      return SUBCOMMANDS.filter(command => command.startsWith(prefix)).map(command => ({ value: command, label: command }));
     },
-  });
-  pi.registerCommand("jev-off", {
-    description: "Disable Jev continuation and cancel any pending judgment",
-    handler: async (_args, ctx) => disable(ctx, "stopped by user"),
-  });
-  pi.registerCommand("jev-status", {
-    description: "Show Jev continuation state, goal, judgment level, thresholds, policy sources, and JSONL log path",
-    handler: async (_args, ctx) => notify(ctx, `${status()}${goal ? `\nGoal: ${goal}` : ""}\n${levelStatus()}\nPolicy sources (activation snapshot): ${policy.length ? policy.map(source => `${source.scope}: ${source.path}`).join("; ") : "none (defaults)"}\nHistory messages: ${historyCount}\nJSONL log: ${getJevLogPath()}`),
-  });
-  pi.registerCommand("jev-max", {
-    description: "Set continuation limit: /jev-max <integer>; 0 means unlimited",
     handler: async (args, ctx) => {
-      const value = parseNonNegativeInteger(args.trim());
-      if (value === undefined) {
-        notify(ctx, "Usage: /jev-max <non-negative integer>; 0 means unlimited", true);
+      const match = /^(\S+)(?:\s+([\s\S]*))?$/.exec(args.trim());
+      const command = match?.[1] ?? "help";
+      const argument = match?.[2]?.trim() ?? "";
+      if (["help", "off", "status"].includes(command) && argument) {
+        notify(ctx, HELP, true);
         return;
       }
-      max = value;
-      updateStatus(ctx);
-    },
-  });
-  pi.registerCommand("jev-history", {
-    description: "Set recent conversation message count sent to Jev; 0 disables history",
-    handler: async (args, ctx) => {
-      const value = parseNonNegativeInteger(args.trim());
-      if (value === undefined) {
-        notify(ctx, "Usage: /jev-history <non-negative integer>; 0 disables history", true);
-        return;
+      switch (command) {
+        case "help":
+          notify(ctx, HELP);
+          return;
+        case "status":
+          showStatus(ctx);
+          return;
+        case "off":
+          disable(ctx, "stopped by user");
+          return;
+        case "on":
+          if (!ctx.isIdle() || ctx.hasPendingMessages() || request || choiceTool.isPending()) {
+            notify(ctx, "Stop the current run before starting a new Jev goal.", true);
+            return;
+          }
+          if (!activate(argument || goal, ctx)) return;
+          try {
+            pi.sendUserMessage(`Work toward this goal:\n${goal}`);
+          } catch {
+            stopIteration(ctx, "pi could not start the goal");
+          }
+          return;
+        case "max":
+        case "history": {
+          const value = parseNonNegativeInteger(argument);
+          if (value === undefined) {
+            notify(ctx, `Usage: /jev-continue ${command} <non-negative integer>; 0 ${command === "max" ? "means unlimited" : "disables history"}`, true);
+            return;
+          }
+          if (command === "max") {
+            max = value;
+            updateStatus(ctx);
+          } else {
+            historyCount = value;
+            notify(ctx, `Jev history: ${historyCount} messages. Applies to subsequent requests.`);
+          }
+          return;
+        }
+        case "level": {
+          if (!argument) {
+            notify(ctx, levelStatus());
+            return;
+          }
+          const nextLevel = parseJudgmentLevel(argument);
+          if (nextLevel === undefined) {
+            notify(ctx, "Usage: /jev-continue level <1–5>; omit the argument to show the current level", true);
+            return;
+          }
+          level = nextLevel;
+          pi.appendEntry("jev-continue-state", { enabled, count, max, level, reason });
+          notify(ctx, `${levelStatus()}\nApplies to subsequent judgments.`);
+          return;
+        }
+        default:
+          notify(ctx, HELP, true);
       }
-      historyCount = value;
-      notify(ctx, `Jev history: ${historyCount} messages. Applies to subsequent requests.`);
-    },
-  });
-  pi.registerCommand("jev-level", {
-    description: "Show or set judgment level: /jev-level [1–5]; applies to subsequent judgments",
-    handler: async (args, ctx) => {
-      const value = args.trim();
-      if (!value) {
-        notify(ctx, levelStatus());
-        return;
-      }
-      const nextLevel = parseJudgmentLevel(value);
-      if (nextLevel === undefined) {
-        notify(ctx, "Usage: /jev-level <1–5>; omit the argument to show the current level", true);
-        return;
-      }
-      level = nextLevel;
-      pi.appendEntry("jev-continue-state", { enabled, count, max, level, reason });
-      notify(ctx, `${levelStatus()}. Applies to subsequent judgments.`);
     },
   });
 

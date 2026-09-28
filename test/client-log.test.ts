@@ -3,7 +3,7 @@ import test, { type TestContext } from "node:test";
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync, rmSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { requestJev } from "../src/client.ts";
+import { requestJev, resolveJevEndpoint } from "../src/client.ts";
 import { isolateJevLogs } from "./log-environment.ts";
 
 const root = isolateJevLogs();
@@ -28,6 +28,7 @@ interface RecordLine {
   durationMs?: number;
   aborted?: boolean;
   kind?: string;
+  url?: string;
 }
 
 function records(path: string): RecordLine[] {
@@ -35,14 +36,67 @@ function records(path: string): RecordLine[] {
   return readdirSync(path).flatMap((name) => readFileSync(join(path, name), "utf8").trimEnd().split("\n").map((line) => JSON.parse(line)));
 }
 
+test("routes requests through the configured base URL and preserves its path prefix", async (t) => {
+  const path = directory(t);
+  let destination: string | URL | Request | undefined;
+  t.mock.method(globalThis, "fetch", async (url: string | URL | Request) => {
+    destination = url;
+    return Response.json({ model: "jev-1.13.0", answers: {}, usage: {} });
+  });
+  await requestJev({}, questions, { ...options, baseUrl: "https://proxy.example.test/gateway/" });
+  assert.equal(destination, "https://proxy.example.test/gateway/v1/systemone");
+  assert.equal(records(path)[0].url, destination);
+});
+
+test("resolves default and prefixed HTTP endpoints without losing the base path", () => {
+  for (const baseUrl of [undefined, "", " \t\n "]) {
+    assert.equal(resolveJevEndpoint(baseUrl), "https://api.typesafe.ai/v1/systemone");
+  }
+  assert.equal(resolveJevEndpoint(" https://proxy.example.test/gateway/// "), "https://proxy.example.test/gateway/v1/systemone");
+  assert.equal(resolveJevEndpoint("http://localhost:8123/nested/base/"), "http://localhost:8123/nested/base/v1/systemone");
+});
+
+test("rejects invalid destinations before logging or HTTP without exposing the input", async (t) => {
+  const path = directory(t);
+  const fetch = t.mock.method(globalThis, "fetch", async () => Response.json({}));
+  const invalidBases = [
+    "https://private-user:private-password@proxy.example.test",
+    "https://private-user@proxy.example.test",
+    "https://proxy.example.test?private-query",
+    "https://proxy.example.test?",
+    "https://proxy.example.test#private-fragment",
+    "https://proxy.example.test#",
+    "ftp://proxy.example.test",
+    "//proxy.example.test",
+    "/gateway",
+    "https:proxy.example.test",
+    "https://",
+    "not a URL",
+  ];
+  for (const baseUrl of invalidBases) {
+    const hidesInput = (error: unknown): boolean => {
+      assert.ok(error instanceof Error);
+      assert.ok(!String(error).includes(baseUrl));
+      assert.ok(!JSON.stringify(error).includes(baseUrl));
+      return true;
+    };
+    assert.throws(() => resolveJevEndpoint(baseUrl), hidesInput);
+    await assert.rejects(requestJev({}, questions, { ...options, baseUrl }), hidesInput);
+  }
+  assert.equal(fetch.mock.callCount(), 0);
+  assert.equal(existsSync(path), false);
+});
+
 test("persists the request before sending and the complete response with a matching ID", async (t) => {
   const path = directory(t);
   const state = { goal: "日本語の目標\n次の行", iteration: 2 };
   const response = '{ "model": "actual-model", "answers": {}, "usage": {"input_tokens": 42} }\n';
-  t.mock.method(globalThis, "fetch", async () => {
+  t.mock.method(globalThis, "fetch", async (url: string | URL | Request) => {
+    assert.equal(url, "https://api.typesafe.ai/v1/systemone");
     const saved = records(path);
     assert.equal(saved.length, 1);
     assert.equal(saved[0].event, "request");
+    assert.equal(saved[0].url, url);
     assert.deepEqual(JSON.parse(saved[0].body!), { state, model: options.model, questions });
     return new Response(response);
   });

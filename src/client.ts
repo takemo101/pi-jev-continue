@@ -3,6 +3,7 @@ import { createJevRequestLog } from "./request-log.ts";
 export interface JevRequestOptions {
   apiKey: string;
   model: string;
+  baseUrl?: string;
   signal: AbortSignal;
 }
 
@@ -15,6 +16,26 @@ export interface JevResponse {
 export interface ChoiceAnswer<T extends string> {
   choice: T;
   confidence: number;
+}
+
+export function resolveJevEndpoint(baseUrl?: string): string {
+  const base = baseUrl?.trim() || "https://api.typesafe.ai";
+  let url: URL;
+  try {
+    url = new URL(base);
+  } catch {
+    throw new Error("Invalid Jev base URL.");
+  }
+  if (
+    !/^https?:\/\//i.test(base)
+    || (url.protocol !== "https:" && url.protocol !== "http:")
+    || url.username !== ""
+    || url.password !== ""
+    || /[?#\\\u0000-\u0020\u007f]/.test(base)
+  ) {
+    throw new Error("Invalid Jev base URL.");
+  }
+  return `${url.href.replace(/\/+$/, "")}/v1/systemone`;
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -77,8 +98,8 @@ export async function requestJev(
 ): Promise<unknown> {
   const { apiKey, model, signal } = options;
   ensureActive(signal);
+  const url = resolveJevEndpoint(options.baseUrl);
   const bodyText = JSON.stringify({ state, model, questions });
-  const url = "https://api.typesafe.ai/v1/systemone";
   const log = createJevRequestLog(apiKey);
   const started = performance.now();
   const durationMs = () => Math.round((performance.now() - started) * 1000) / 1000;
@@ -90,7 +111,7 @@ export async function requestJev(
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
       body: bodyText,
       signal,
-      // 固定 API 以外へ認証ヘッダーを転送しない。
+      // 設定した送信先以外へ認証ヘッダーを転送しない。
       redirect: "error",
     });
   } catch {
