@@ -55,7 +55,7 @@ never include secrets.
 | --- | --- |
 | Precedence | Explicit user instructions > project > personal > defaults; retain nonconflicting rules. A broad goal does not waive narrower stop conditions. |
 | Discovery | Only the two paths above; no ancestor or Git-root search. |
-| Updates | Snapshot at `/jev-on`; edits require stopping the current run and reactivating. `/jev-status` shows sources. |
+| Updates | Snapshot at `/jev-continue on`; edits require stopping the current run and reactivating. `/jev-continue status` shows sources. |
 | Limits | Regular UTF-8 files, 8000 combined content bytes; total judgment state remains bounded at 24000 bytes. |
 | Privacy | Contents and absolute paths reach the development model, TypeSafe, and logs. |
 
