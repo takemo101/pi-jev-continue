@@ -7,6 +7,7 @@ import { buildState, DEFAULT_HISTORY_COUNT, extractConversation, INPUT_LIMITS } 
 import { registerChoiceTool } from "./question-tool.ts";
 import { getJevLogPath } from "./request-log.ts";
 import { EMPTY_POLICY, loadContinuationPolicy, POLICY_INSTRUCTIONS, type ContinuationPolicy } from "./policy.ts";
+import { DEFAULT_JUDGMENT_LEVEL, getJudgmentThresholds, parseJudgmentLevel, type JudgmentLevel } from "./thresholds.ts";
 
 const DEFAULT_MODEL = "jev-1.13.0";
 const JUDGMENT_TIMEOUT_MS = 30_000;
@@ -54,6 +55,7 @@ export default function jevContinue(pi: ExtensionAPI) {
   let count = 0;
   let max = 0;
   let historyCount = DEFAULT_HISTORY_COUNT;
+  let level: JudgmentLevel = DEFAULT_JUDGMENT_LEVEL;
   let reason = "not started";
   let previousReport: string | null = null;
   // 中断だけでは応答到着と競合し得るため、世代番号でも古い結果の適用を防ぐ。
@@ -64,6 +66,10 @@ export default function jevContinue(pi: ExtensionAPI) {
   let removeTerminalListener: (() => void) | undefined;
 
   const status = () => `Jev ${enabled ? "on" : "off"} ${count}/${max || "unlimited"}: ${reason}`;
+  const levelStatus = () => {
+    const { minConfidence, maxNeedsHuman, minInScope } = getJudgmentThresholds(level);
+    return `Level: ${level} (minConfidence: ${minConfidence}, maxNeedsHuman: ${maxNeedsHuman}, minInScope: ${minInScope})`;
+  };
   const updateStatus = (ctx: ExtensionContext) => {
     ctx.ui.setStatus("jev-continue", status());
   };
@@ -85,7 +91,7 @@ export default function jevContinue(pi: ExtensionAPI) {
     cancelRequest();
     waitingForInput = enabled;
     updateStatus(ctx);
-    pi.appendEntry("jev-continue-state", { enabled, count, max, reason });
+    pi.appendEntry("jev-continue-state", { enabled, count, max, level, reason });
     notify(ctx, status());
   };
   const disable = (ctx: ExtensionContext, why: string) => {
@@ -120,7 +126,7 @@ export default function jevContinue(pi: ExtensionAPI) {
     enabled = true;
     reason = "working";
     updateStatus(ctx);
-    pi.appendEntry("jev-continue-state", { enabled, goal, policy, count, max, reason });
+    pi.appendEntry("jev-continue-state", { enabled, goal, policy, count, max, level, reason });
     return true;
   };
   const directive = (action: string) => `${action}\n\n${REPORT_INSTRUCTIONS}\n\n${POLICY_INSTRUCTIONS}\n\npolicy (fixed activation snapshot):\n${JSON.stringify(policy)}\n\nGoal:\n${goal}`;
@@ -128,6 +134,7 @@ export default function jevContinue(pi: ExtensionAPI) {
   const choiceTool = registerChoiceTool(pi, {
     getGoal: () => enabled ? goal : undefined,
     getPolicy: () => policy,
+    getLevel: () => level,
     getConversation: (ctx) => historyCount === 0 ? [] : extractConversation(ctx.sessionManager.buildSessionProjection().messages, historyCount),
     getRequestOptions: getJevOptions,
     waitForHuman: stopIteration,
@@ -153,6 +160,7 @@ export default function jevContinue(pi: ExtensionAPI) {
   pi.registerFlag("jev-goal", { type: "string", description: "Enable Jev continuation for this goal on the first prompt" });
   pi.registerFlag("jev-max", { type: "string", default: "0", description: "Maximum Jev continuations; 0 means unlimited" });
   pi.registerFlag("jev-history", { type: "string", default: String(DEFAULT_HISTORY_COUNT), description: "Recent public conversation messages sent to Jev; 0 disables history" });
+  pi.registerFlag("jev-level", { type: "string", default: String(DEFAULT_JUDGMENT_LEVEL), description: "Judgment level 1–5; 1 is loosest and 5 is strictest (default)" });
 
   pi.on("session_start", (event, ctx) => {
     cancelRequest();
@@ -165,6 +173,7 @@ export default function jevContinue(pi: ExtensionAPI) {
     count = 0;
     max = 0;
     historyCount = DEFAULT_HISTORY_COUNT;
+    level = DEFAULT_JUDGMENT_LEVEL;
     reason = "session started; explicit activation required";
     previousReport = null;
     pendingGoal = undefined;
@@ -172,11 +181,15 @@ export default function jevContinue(pi: ExtensionAPI) {
       const flagGoal = pi.getFlag("jev-goal");
       const flagMax = parseNonNegativeInteger(String(pi.getFlag("jev-max") ?? "0"));
       const flagHistory = parseNonNegativeInteger(String(pi.getFlag("jev-history") ?? DEFAULT_HISTORY_COUNT));
+      const flagLevel = parseJudgmentLevel(String(pi.getFlag("jev-level") ?? DEFAULT_JUDGMENT_LEVEL));
       if (flagMax === undefined || flagHistory === undefined) {
         notify(ctx, `Invalid --jev-${flagMax === undefined ? "max" : "history"}: use a non-negative integer. Automation is disabled.`, true);
+      } else if (flagLevel === undefined) {
+        notify(ctx, "Invalid --jev-level: use an integer from 1 to 5. Automation is disabled.", true);
       } else {
         max = flagMax;
         historyCount = flagHistory;
+        level = flagLevel;
         if (typeof flagGoal === "string") pendingGoal = flagGoal;
       }
     }
@@ -244,6 +257,7 @@ export default function jevContinue(pi: ExtensionAPI) {
     ctx: ExtensionContext,
   ): Promise<AgentBeforeSettleEventResult | undefined> {
     const ticket = generation;
+    const judgmentLevel = level;
     const controller = new AbortController();
     request = controller;
     // 境界では ctx.signal がない場合がある。独自の中断とタイムアウトを常に用意する。
@@ -254,7 +268,7 @@ export default function jevContinue(pi: ExtensionAPI) {
     updateStatus(ctx);
     try {
       const state = buildState(goal, messages, previousReport, count + 1, historyCount, policy);
-      const result = await judge(state, getJevOptions(signal));
+      const result = await judge(state, getJevOptions(signal), judgmentLevel);
       // await 中に停止・新規開始・セッション切替が起きたら、通知もログも残さない。
       if (generation !== ticket || !enabled) return;
       if (signal.aborted) {
@@ -266,7 +280,7 @@ export default function jevContinue(pi: ExtensionAPI) {
         stopIteration(ctx, "queued input takes priority");
         return;
       }
-      pi.appendEntry("jev-judgment", { iteration: count + 1, ...result });
+      pi.appendEntry("jev-judgment", { iteration: count + 1, level: judgmentLevel, ...result });
       if (result.action === "stop") {
         stopIteration(ctx, result.reason);
         return;
@@ -322,8 +336,8 @@ export default function jevContinue(pi: ExtensionAPI) {
     handler: async (_args, ctx) => disable(ctx, "stopped by user"),
   });
   pi.registerCommand("jev-status", {
-    description: "Show Jev continuation state, goal, policy sources, and JSONL log path",
-    handler: async (_args, ctx) => notify(ctx, `${status()}${goal ? `\nGoal: ${goal}` : ""}\nPolicy sources (activation snapshot): ${policy.length ? policy.map(source => `${source.scope}: ${source.path}`).join("; ") : "none (defaults)"}\nHistory messages: ${historyCount}\nJSONL log: ${getJevLogPath()}`),
+    description: "Show Jev continuation state, goal, judgment level, thresholds, policy sources, and JSONL log path",
+    handler: async (_args, ctx) => notify(ctx, `${status()}${goal ? `\nGoal: ${goal}` : ""}\n${levelStatus()}\nPolicy sources (activation snapshot): ${policy.length ? policy.map(source => `${source.scope}: ${source.path}`).join("; ") : "none (defaults)"}\nHistory messages: ${historyCount}\nJSONL log: ${getJevLogPath()}`),
   });
   pi.registerCommand("jev-max", {
     description: "Set continuation limit: /jev-max <integer>; 0 means unlimited",
@@ -347,6 +361,24 @@ export default function jevContinue(pi: ExtensionAPI) {
       }
       historyCount = value;
       notify(ctx, `Jev history: ${historyCount} messages. Applies to subsequent requests.`);
+    },
+  });
+  pi.registerCommand("jev-level", {
+    description: "Show or set judgment level: /jev-level [1–5]; applies to subsequent judgments",
+    handler: async (args, ctx) => {
+      const value = args.trim();
+      if (!value) {
+        notify(ctx, levelStatus());
+        return;
+      }
+      const nextLevel = parseJudgmentLevel(value);
+      if (nextLevel === undefined) {
+        notify(ctx, "Usage: /jev-level <1–5>; omit the argument to show the current level", true);
+        return;
+      }
+      level = nextLevel;
+      pi.appendEntry("jev-continue-state", { enabled, count, max, level, reason });
+      notify(ctx, `${levelStatus()}. Applies to subsequent judgments.`);
     },
   });
 

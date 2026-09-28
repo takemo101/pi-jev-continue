@@ -4,6 +4,7 @@ import { judge } from "../src/jev.ts";
 import type { JudgmentState } from "../src/state.ts";
 import { EMPTY_POLICY } from "../src/policy.ts";
 import { isolateJevLogs } from "./log-environment.ts";
+import { getJudgmentThresholds, type JudgmentLevel } from "../src/thresholds.ts";
 
 isolateJevLogs();
 
@@ -41,28 +42,55 @@ function fixture(choice = "verify", confidence = 0.9, human = 0.01, scope = 0.99
   };
 }
 
+test("level 3 continues a judgment that level 5 stops", async (t) => {
+  t.mock.method(globalThis, "fetch", async () => Response.json(fixture("verify", 0.78, 0.18, 0.82)));
+  assert.equal((await judge(state, options, 5)).action, "stop");
+  assert.equal((await judge(state, options, 3)).action, "verify");
+});
+
 // These fixtures test deterministic policy, not the accuracy of Jev's judgments.
-for (const action of ["implement", "fix", "verify", "improve"]) {
-  test(`allows ${action} at all inclusive decision boundaries`, async (t) => {
-    t.mock.method(globalThis, "fetch", async () => Response.json(fixture(action, 0.85, 0.1, 0.9)));
-    assert.equal((await judge(state, options)).action, action);
-  });
+const boundaries = [
+  { level: 1, confidence: 0.65, human: 0.3, scope: 0.7 },
+  { level: 2, confidence: 0.7, human: 0.25, scope: 0.75 },
+  { level: 3, confidence: 0.75, human: 0.2, scope: 0.8 },
+  { level: 4, confidence: 0.8, human: 0.15, scope: 0.85 },
+  { level: 5, confidence: 0.85, human: 0.1, scope: 0.9 },
+] as const;
+
+for (const { level, confidence, human, scope } of boundaries) {
+  for (const action of ["implement", "fix", "verify", "improve"]) {
+    test(`level ${level} allows ${action} at all inclusive decision boundaries`, async (t) => {
+      t.mock.method(globalThis, "fetch", async () => Response.json(fixture(action, confidence, human, scope)));
+      assert.equal((await judge(state, options, level)).action, action);
+    });
+  }
+  for (const scenario of [
+    { name: "confidence below the floor", confidence: confidence - 0.000001, human, scope, reason: /confidence/i },
+    { name: "human dependency above the ceiling", confidence, human: human + 0.000001, scope, reason: /human/i },
+    { name: "scope below the floor", confidence, human, scope: scope - 0.000001, reason: /goal/i },
+  ]) {
+    test(`level ${level} stops for ${scenario.name}`, async (t) => {
+      t.mock.method(globalThis, "fetch", async () => Response.json(
+        fixture("verify", scenario.confidence, scenario.human, scenario.scope),
+      ));
+      const result = await judge(state, options, level);
+      assert.equal(result.action, "stop");
+      assert.match(result.reason, scenario.reason);
+    });
+  }
 }
 
 for (const scenario of [
-  { name: "confidence just below the floor", confidence: 0.849999, human: 0.1, scope: 0.9, reason: /confidence/i },
   { name: "uncertain next action", confidence: 0.5, human: 0.1, scope: 0.9, reason: /confidence/i },
-  { name: "human risk just above the ceiling", confidence: 0.85, human: 0.100001, scope: 0.9, reason: /human/i },
   { name: "uncertain human dependency", confidence: 0.9, human: 0.5, scope: 0.99, reason: /human/i },
-  { name: "scope just below the floor", confidence: 0.85, human: 0.1, scope: 0.899999, reason: /goal/i },
   { name: "out-of-scope action", confidence: 0.9, human: 0, scope: 0, reason: /goal/i },
   { name: "uncertain scope", confidence: 0.9, human: 0, scope: 0.5, reason: /goal/i },
 ]) {
-  test(`pauses for ${scenario.name}`, async (t) => {
+  test(`level 1 pauses for ${scenario.name}`, async (t) => {
     t.mock.method(globalThis, "fetch", async () => Response.json(
       fixture("verify", scenario.confidence, scenario.human, scenario.scope),
     ));
-    const result = await judge(state, options);
+    const result = await judge(state, options, 1);
     assert.equal(result.action, "stop");
     assert.match(result.reason, scenario.reason);
   });
@@ -70,14 +98,14 @@ for (const scenario of [
 
 test("human veto takes precedence over scope, low confidence, and no actionable task", async (t) => {
   t.mock.method(globalThis, "fetch", async () => Response.json(fixture("other", 0.2, 1, 0)));
-  const result = await judge(state, options);
+  const result = await judge(state, options, 1);
   assert.equal(result.action, "stop");
   assert.match(result.reason, /human/i);
 });
 
 test("other pauses even with confident, in-scope, human-independent answers", async (t) => {
   t.mock.method(globalThis, "fetch", async () => Response.json(fixture("other", 1, 0, 1)));
-  const result = await judge(state, options);
+  const result = await judge(state, options, 1);
   assert.equal(result.action, "stop");
   assert.match(result.reason, /no supported concrete next action/i);
 });
@@ -118,19 +146,19 @@ const malformed = [
 for (const scenario of malformed) {
   test(`rejects ${scenario.name}`, async (t) => {
     t.mock.method(globalThis, "fetch", async () => Response.json(scenario.body));
-    await assert.rejects(judge(state, options), /invalid judgment response/i);
+    await assert.rejects(judge(state, options, 1), /invalid judgment response/i);
   });
 }
 
 test("rejects non-finite probability parsed from JSON", async (t) => {
   const body = JSON.stringify(withNext({ confidence: "overflow" })).replace('"overflow"', "1e999");
   t.mock.method(globalThis, "fetch", async () => new Response(body));
-  await assert.rejects(judge(state, options), /invalid judgment response/i);
+  await assert.rejects(judge(state, options, 1), /invalid judgment response/i);
 });
 
 test("invalid JSON errors do not expose response text", async (t) => {
   t.mock.method(globalThis, "fetch", async () => new Response(`private provider text ${options.apiKey}`));
-  await assert.rejects(judge(state, options), (error: Error) => {
+  await assert.rejects(judge(state, options, 1), (error: Error) => {
     assert.match(error.message, /invalid judgment response/i);
     assert.doesNotMatch(error.message, /private provider text|test-secret-key/);
     return true;
@@ -141,7 +169,7 @@ test("HTTP failure fails closed without retry or leaking body or credentials", a
   const fetchMock = t.mock.method(globalThis, "fetch", async () => new Response(
     `private provider text ${options.apiKey}`, { status: 429, statusText: options.apiKey },
   ));
-  await assert.rejects(judge(state, options), (error: Error) => {
+  await assert.rejects(judge(state, options, 1), (error: Error) => {
     assert.match(error.message, /HTTP 429/);
     assert.doesNotMatch(error.message, /private provider text|test-secret-key/);
     return true;
@@ -151,7 +179,7 @@ test("HTTP failure fails closed without retry or leaking body or credentials", a
 
 test("network failures do not expose exception details", async (t) => {
   t.mock.method(globalThis, "fetch", async () => { throw new Error(`network details ${options.apiKey}`); });
-  await assert.rejects(judge(state, options), (error: Error) => {
+  await assert.rejects(judge(state, options, 1), (error: Error) => {
     assert.match(error.message, /request failed/i);
     assert.doesNotMatch(error.message, /network details|test-secret-key/);
     return true;
@@ -162,7 +190,7 @@ test("already-cancelled judgments never contact the service", async (t) => {
   const controller = new AbortController();
   controller.abort(new Error(options.apiKey));
   const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(fixture()));
-  await assert.rejects(judge(state, { ...options, signal: controller.signal }), { name: "AbortError" });
+  await assert.rejects(judge(state, { ...options, signal: controller.signal }, 1), { name: "AbortError" });
   assert.equal(fetchMock.mock.callCount(), 0);
 });
 
@@ -173,11 +201,31 @@ test("cancellation while waiting for the service rejects instead of continuing",
     init?.signal?.addEventListener("abort", () => reject(new Error(options.apiKey)), { once: true });
     return promise;
   });
-  const pending = judge(state, { ...options, signal: controller.signal });
+  const pending = judge(state, { ...options, signal: controller.signal }, 1);
   controller.abort();
   await assert.rejects(pending, (error: Error) => {
     assert.equal(error.name, "AbortError");
     assert.doesNotMatch(error.message, /test-secret-key/);
     return true;
   });
+});
+
+test("invalid runtime levels reject before HTTP", async (t) => {
+  const fetchMock = t.mock.method(globalThis, "fetch", async () => Response.json(fixture()));
+  for (const level of [0, 6, -1, 1.5, NaN, Infinity, "1", undefined, null]) {
+    await assert.rejects(Reflect.apply(judge, undefined, [state, options, level]), /judgment level/i);
+  }
+  assert.equal(fetchMock.mock.callCount(), 0);
+});
+
+test("an in-flight judgment retains its level and rejects threshold mutation", async (t) => {
+  const response = Promise.withResolvers<Response>();
+  t.mock.method(globalThis, "fetch", async () => (await response.promise).clone());
+  let level: JudgmentLevel = 1;
+  const pending = judge(state, options, level);
+  assert.equal(Reflect.set(getJudgmentThresholds(level), "minConfidence", 1), false);
+  level = 5;
+  response.resolve(Response.json(fixture("verify", 0.65, 0.3, 0.7)));
+  assert.equal((await pending).action, "verify");
+  assert.equal((await judge(state, options, level)).action, "stop");
 });
